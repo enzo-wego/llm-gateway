@@ -106,17 +106,49 @@ Runs **native, not in Docker** — it needs the host's Claude CLI login.
 ```bash
 cd /var/go/src/github.com/llm-gateway
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
 claude setup-token          # interactive, one-time — needs a human
-cp .env.example .env        # fill in secrets
+cp .env.example .env        # fill in secrets, incl. CLAUDE_CODE_OAUTH_TOKEN
+chmod 600 .env
+
 sudo cp deploy/llm-gateway.service /etc/systemd/system/
-sudo systemctl enable --now llm-gateway
-curl -s localhost:8750/health
+sudo systemctl daemon-reload && sudo systemctl enable --now llm-gateway
+curl -s http://172.18.0.1:8750/health
 ```
 
-**Binding:** agent-mem's worker runs in Docker, so `127.0.0.1` on the host is not
-reachable from it. Set `LLM_GATEWAY_HOST` to the Docker bridge gateway (usually
-`172.17.0.1`) so containers can reach the service while the outside world cannot.
-Confirm the right address with `ip -4 addr show docker0`.
+Three things bite here, all found the hard way during the first deploy.
+
+**1 · The OAuth token must be in `.env`, not your shell.** `claude setup-token`
+gives you a token you probably exported in `~/.zshrc`. systemd does not read
+shell rc files, so the service starts unauthenticated unless
+`CLAUDE_CODE_OAUTH_TOKEN` is in the `EnvironmentFile`.
+
+**2 · Bind to the right bridge.** agent-mem's worker is in Docker, so the host's
+`127.0.0.1` is unreachable from it. Bind to the gateway of *the network the
+worker is actually on* — `agent-mem_default` is `172.18.0.1`, **not** the
+default `docker0` at `172.17.0.1`. Check with:
+
+```bash
+docker inspect $(docker ps --filter name=worker -q) \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{$v.Gateway}}{{end}}'
+```
+
+**3 · ufw blocks container→host by default.** Binding correctly is not enough;
+the firewall drops it and `wget` just times out with no useful error. Open the
+subnet explicitly:
+
+```bash
+sudo ufw allow from 172.18.0.0/16 to any port 8750 proto tcp \
+  comment 'agent-mem worker -> llm-gateway'
+```
+
+Verify the whole path from inside the network, not just from the host — the host
+can reach a bound port that containers cannot:
+
+```bash
+docker run --rm --network agent-mem_default alpine:3 \
+  wget -qO- http://172.18.0.1:8750/health
+```
 
 ## Status
 
