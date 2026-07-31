@@ -1,0 +1,45 @@
+[Unit]
+Description=llm-gateway — Claude seat + OpenRouter behind one HTTP surface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=enzo
+WorkingDirectory=/var/go/src/github.com/llm-gateway
+
+# Secrets and backend switches. Flipping a route between claude and openrouter
+# is an edit here plus `systemctl restart llm-gateway` — no consumer deploy.
+EnvironmentFile=/var/go/src/github.com/llm-gateway/.env
+
+# The Claude CLI resolves an API key ahead of the claude.ai login, so a stray
+# ANTHROPIC_API_KEY would silently bill the key instead of the seat. The app
+# also pops it at import; this is belt and braces.
+UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+
+# The bundled CLI writes session state under $HOME — without this it lands
+# somewhere systemd controls and the login is not found.
+Environment=HOME=/home/enzo
+
+ExecStart=/var/go/src/github.com/llm-gateway/.venv/bin/uvicorn app.main:app \
+    --host ${LLM_GATEWAY_HOST} --port ${LLM_GATEWAY_PORT} --log-level info
+
+Restart=on-failure
+RestartSec=5s
+
+# The CLI spawns Node subprocesses per request; give them room but cap the blast
+# radius of a runaway.
+LimitNOFILE=8192
+MemoryMax=2G
+
+# Hardening. NOT ProtectHome — the CLI needs $HOME for its credentials.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llm-gateway
+
+[Install]
+WantedBy=multi-user.target

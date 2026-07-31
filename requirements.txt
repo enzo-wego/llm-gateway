@@ -1,0 +1,4 @@
+claude-agent-sdk>=0.2.128
+fastapi>=0.115
+uvicorn[standard]>=0.32
+httpx>=0.27
