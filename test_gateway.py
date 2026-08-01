@@ -26,7 +26,7 @@ import tempfile
 os.environ.setdefault("LLM_GATEWAY_API_KEY", "test")
 os.environ.setdefault("OPENROUTER_API_KEY", "sk-or-test")
 
-from app import openrouter  # noqa: E402
+from app import claude, openrouter  # noqa: E402
 from app.main import _Quota, _tier_config, app  # noqa: E402
 from app import config  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -48,6 +48,32 @@ def isolated_config_env(initial: str):
             for name, value in old_values.items():
                 setattr(config, name, value)
             config.ENV_FILE = old_path
+
+
+def test_claude_unwraps_entire_fenced_block() -> None:
+    cases = [
+        ("fenced JSON", '```json\n{"ok":true}\n```', '{"ok":true}'),
+        ("bare fence", '```\n{"ok":true}\n```', '{"ok":true}'),
+        ("bare JSON", '{"ok":true}', '{"ok":true}'),
+        (
+            "fence inside prose",
+            'Result:\n```json\n{"ok":true}\n```\nDone.',
+            'Result:\n```json\n{"ok":true}\n```\nDone.',
+        ),
+        ("unclosed fence", '```json\n{"ok":true}', '```json\n{"ok":true}'),
+        ("non-JSON content", "```text\nnot JSON\n```", "not JSON"),
+        # Splicing two blocks together would produce a corrupt body that still
+        # looks like a successful response — leave ambiguous input alone.
+        (
+            "two adjacent blocks",
+            '```json\n{"a":1}\n```\n```json\n{"b":2}\n```',
+            '```json\n{"a":1}\n```\n```json\n{"b":2}\n```',
+        ),
+    ]
+
+    for name, response, expected in cases:
+        actual = claude._unwrap_fenced_block(response)
+        assert actual == expected, f"{name}: got {actual!r}"
 
 
 def test_embed_reorders_by_index() -> None:

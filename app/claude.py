@@ -40,6 +40,28 @@ class ClaudeError(RuntimeError):
 _MAX_TURNS = 4
 
 
+def _unwrap_fenced_block(text: str) -> str:
+    """Remove a fence only when it wraps the entire response.
+
+    Callers parse this as JSON because that is what the OpenRouter path
+    guaranteed via response_format=json_object. The Agent SDK makes no such
+    promise without a schema, so the model fences its answer like it would in
+    chat and every json.Unmarshal downstream dies on the backtick.
+
+    Unwrap only the unambiguous case: one fence opening the first line, one
+    closing the last, and none in between. Two adjacent blocks would otherwise
+    be spliced into a single corrupt body — a silent wrong answer, which is
+    worse than the fenced text this exists to fix.
+    """
+    stripped = text.strip()
+    lines = stripped.splitlines()
+    if len(lines) < 2 or not lines[0].startswith("```") or lines[-1] != "```":
+        return text
+    if any(line.startswith("```") for line in lines[1:-1]):
+        return text
+    return "\n".join(lines[1:-1]).strip()
+
+
 def _options(model: str, effort: str, system: str, schema: dict[str, Any] | None) -> sdk.ClaudeAgentOptions:
     return sdk.ClaudeAgentOptions(
         model=model,
@@ -114,8 +136,8 @@ async def _run(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, Any]:
         joined = "".join(text_parts).strip()
         if not joined:
             raise ClaudeError("empty response from Claude")
-        # No schema was requested, so the caller wanted raw text.
-        return {"text": joined, "meta": meta}
+        # Match OpenRouter's bare json_object response contract.
+        return {"text": _unwrap_fenced_block(joined), "meta": meta}
 
     return {"output": structured, "meta": meta}
 
