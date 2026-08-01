@@ -1,12 +1,18 @@
-"""Runtime configuration, read once from the environment at import time.
+"""Runtime configuration owned and persisted by llm-gateway.
 
-The service is deliberately configured by env vars only (no settings DB, no
-config file) — it is a single native process owned by systemd, and its whole
-job is to front two upstreams. Anything that needs to change per-request is a
-request field, not config.
+Values start from the process environment. The editable, non-secret subset can
+also be changed live through the authenticated config endpoint; those updates
+are written atomically to the service's ``.env`` so restarts keep them.
 """
 
+import math
 import os
+from pathlib import Path
+import re
+import stat
+import tempfile
+import threading
+from typing import Any
 
 # ── Auth precedence trap ─────────────────────────────────────────────────────
 # The Claude CLI resolves credentials in a fixed order and an API key WINS over
@@ -115,3 +121,168 @@ SLACK_ALERT_CHANNEL = os.getenv("SLACK_ALERT_CHANNEL", "").strip()
 ALERT_DEDUPE_S = _int("LLM_GATEWAY_ALERT_DEDUPE_S", 1800)
 
 ALERTS_ENABLED = bool(SLACK_BOT_TOKEN and SLACK_ALERT_CHANNEL)
+
+
+# ── Live editable configuration ─────────────────────────────────────────────
+# API names intentionally match the runtime globals while env names retain the
+# service prefix. Secrets and network/service settings are absent by design.
+EDITABLE_ENV_KEYS = {
+    "BACKEND_SUMMARY": "LLM_GATEWAY_BACKEND_SUMMARY",
+    "BACKEND_CHEAP": "LLM_GATEWAY_BACKEND_CHEAP",
+    "BACKEND_DESCRIBE": "LLM_GATEWAY_BACKEND_DESCRIBE",
+    "MODEL_SUMMARY": "LLM_GATEWAY_MODEL_SUMMARY",
+    "MODEL_CHEAP": "LLM_GATEWAY_MODEL_CHEAP",
+    "OR_MODEL_SUMMARY": "LLM_GATEWAY_OR_MODEL_SUMMARY",
+    "OR_MODEL_CHEAP": "LLM_GATEWAY_OR_MODEL_CHEAP",
+    "EFFORT_SUMMARY": "LLM_GATEWAY_EFFORT_SUMMARY",
+    "EFFORT_CHEAP": "LLM_GATEWAY_EFFORT_CHEAP",
+    "FALLBACK_ON_QUOTA": "LLM_GATEWAY_FALLBACK_ON_QUOTA",
+    "MAX_BUDGET_USD": "LLM_GATEWAY_MAX_BUDGET_USD",
+    "CLAUDE_TIMEOUT_S": "LLM_GATEWAY_CLAUDE_TIMEOUT_S",
+}
+
+_BACKENDS = {"claude", "openrouter"}
+_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+_MODEL_KEYS = {"MODEL_SUMMARY", "MODEL_CHEAP", "OR_MODEL_SUMMARY", "OR_MODEL_CHEAP"}
+_CONFIG_LOCK = threading.Lock()
+_ENV_ASSIGNMENT = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=).*$")
+
+# systemd starts the service with the repository as WorkingDirectory. Tests can
+# override this path without changing process-wide environment state.
+ENV_FILE = Path(os.getenv("LLM_GATEWAY_ENV_FILE", ".env"))
+
+
+class ConfigValidationError(ValueError):
+    """A requested runtime value is unknown or unsafe to apply."""
+
+
+def editable_config() -> dict[str, Any]:
+    """Return current non-secret values safe to expose to authenticated clients."""
+    with _CONFIG_LOCK:
+        return {name: globals()[name] for name in EDITABLE_ENV_KEYS}
+
+
+def _positive_float(name: str, value: Any) -> float:
+    if isinstance(value, bool):
+        raise ConfigValidationError(f"{name} must be a positive number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigValidationError(f"{name} must be a positive number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ConfigValidationError(f"{name} must be a positive number")
+    return parsed
+
+
+def _positive_int(name: str, value: Any) -> int:
+    parsed = _positive_float(name, value)
+    if not parsed.is_integer():
+        raise ConfigValidationError(f"{name} must be a positive integer")
+    return int(parsed)
+
+
+def _validate_updates(updates: dict[str, Any]) -> dict[str, Any]:
+    unknown = sorted(set(updates) - set(EDITABLE_ENV_KEYS))
+    if unknown:
+        raise ConfigValidationError(f"unknown config key(s): {', '.join(unknown)}")
+
+    validated: dict[str, Any] = {}
+    for name, value in updates.items():
+        if name.startswith("BACKEND_"):
+            if not isinstance(value, str) or value.strip().lower() not in _BACKENDS:
+                raise ConfigValidationError(f"{name} must be claude or openrouter")
+            validated[name] = value.strip().lower()
+        elif name.startswith("EFFORT_"):
+            if not isinstance(value, str) or value.strip().lower() not in _EFFORTS:
+                raise ConfigValidationError(
+                    f"{name} must be one of: {', '.join(sorted(_EFFORTS))}"
+                )
+            validated[name] = value.strip().lower()
+        elif name in _MODEL_KEYS:
+            if not isinstance(value, str) or not value.strip() or any(ch.isspace() for ch in value):
+                raise ConfigValidationError(f"{name} must be a non-empty model id without whitespace")
+            validated[name] = value
+        elif name == "FALLBACK_ON_QUOTA":
+            if isinstance(value, bool):
+                validated[name] = value
+            elif isinstance(value, str) and value.strip().lower() in ("true", "false"):
+                validated[name] = value.strip().lower() == "true"
+            else:
+                raise ConfigValidationError(f"{name} must be true or false")
+        elif name == "MAX_BUDGET_USD":
+            validated[name] = _positive_float(name, value)
+        elif name == "CLAUDE_TIMEOUT_S":
+            timeout = _positive_int(name, value)
+            if timeout >= 200:
+                raise ConfigValidationError(
+                    "CLAUDE_TIMEOUT_S must be below agent-mem's 200s gateway client timeout"
+                )
+            validated[name] = timeout
+    return validated
+
+
+def _env_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return format(value, ".15g")
+    return str(value)
+
+
+def _rewrite_env(path: Path, updates: dict[str, Any]) -> None:
+    """Atomically rewrite only requested keys, preserving every other line."""
+    try:
+        original = path.read_text() if path.exists() else ""
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    except OSError as exc:
+        raise RuntimeError(f"read {path}: {exc}") from exc
+
+    by_env = {EDITABLE_ENV_KEYS[name]: _env_value(value) for name, value in updates.items()}
+    remaining = set(by_env)
+    lines = original.splitlines(keepends=True)
+    rewritten: list[str] = []
+    for line in lines:
+        bare = line.rstrip("\r\n")
+        newline = line[len(bare):]
+        match = _ENV_ASSIGNMENT.match(bare)
+        if match and match.group(2) in by_env:
+            env_name = match.group(2)
+            rewritten.append(
+                f"{match.group(1)}{env_name}{match.group(3)}{by_env[env_name]}{newline}"
+            )
+            remaining.discard(env_name)
+        else:
+            rewritten.append(line)
+
+    if remaining:
+        if rewritten and not rewritten[-1].endswith(("\n", "\r")):
+            rewritten[-1] += "\n"
+        for env_name in by_env:
+            if env_name in remaining:
+                rewritten.append(f"{env_name}={by_env[env_name]}\n")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+    try:
+        with os.fdopen(fd, "w") as tmp:
+            os.fchmod(tmp.fileno(), mode)
+            tmp.writelines(rewritten)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def update_config(updates: dict[str, Any]) -> dict[str, Any]:
+    """Validate, persist, then apply a partial update to the live process."""
+    validated = _validate_updates(updates)
+    with _CONFIG_LOCK:
+        if validated:
+            _rewrite_env(ENV_FILE, validated)
+            globals().update(validated)
+        return {name: globals()[name] for name in EDITABLE_ENV_KEYS}

@@ -16,15 +16,38 @@ backend 502s. These two do not:
 """
 
 import asyncio
+from contextlib import contextmanager
 import os
+from pathlib import Path
+import stat
 import sys
+import tempfile
 
 os.environ.setdefault("LLM_GATEWAY_API_KEY", "test")
 os.environ.setdefault("OPENROUTER_API_KEY", "sk-or-test")
 
 from app import openrouter  # noqa: E402
-from app.main import _Quota, _tier_config  # noqa: E402
+from app.main import _Quota, _tier_config, app  # noqa: E402
 from app import config  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+
+@contextmanager
+def isolated_config_env(initial: str):
+    """Point config writes at a temporary .env and restore live values after."""
+    old_path = config.ENV_FILE
+    old_values = config.editable_config()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / ".env"
+        path.write_text(initial)
+        path.chmod(0o600)
+        config.ENV_FILE = path
+        try:
+            yield path
+        finally:
+            for name, value in old_values.items():
+                setattr(config, name, value)
+            config.ENV_FILE = old_path
 
 
 def test_embed_reorders_by_index() -> None:
@@ -121,6 +144,77 @@ def test_api_key_is_unset_at_import() -> None:
     """config.py must strip the credential that would silently bill the API key."""
     assert "ANTHROPIC_API_KEY" not in os.environ
     assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
+
+
+def test_config_get_is_authenticated_and_never_returns_secrets() -> None:
+    client = TestClient(app)
+    assert client.get("/config").status_code == 401
+
+    response = client.get("/config", headers={"X-API-Key": config.API_KEY})
+    assert response.status_code == 200
+    assert set(response.json()) == set(config.EDITABLE_ENV_KEYS)
+    encoded = response.text
+    assert "API_KEY" not in encoded
+    assert config.OPENROUTER_KEY not in encoded
+
+
+def test_config_put_applies_partial_update_and_preserves_env() -> None:
+    original = (
+        "# gateway settings\n"
+        "UNRELATED=keep-me\n"
+        "LLM_GATEWAY_BACKEND_SUMMARY=claude\n"
+        "LLM_GATEWAY_MODEL_CHEAP=unchanged-model\n"
+    )
+    with isolated_config_env(original) as env_path:
+        client = TestClient(app)
+        response = client.put(
+            "/config",
+            headers={"X-API-Key": config.API_KEY},
+            json={
+                "BACKEND_SUMMARY": "openrouter",
+                "FALLBACK_ON_QUOTA": False,
+                "MAX_BUDGET_USD": "0.75",
+                "CLAUDE_TIMEOUT_S": "199",
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["BACKEND_SUMMARY"] == "openrouter"
+        assert body["FALLBACK_ON_QUOTA"] is False
+        assert body["MAX_BUDGET_USD"] == 0.75
+        assert body["CLAUDE_TIMEOUT_S"] == 199
+        assert config.BACKEND_SUMMARY == "openrouter"
+
+        persisted = env_path.read_text()
+        assert "# gateway settings\n" in persisted
+        assert "UNRELATED=keep-me\n" in persisted
+        assert "LLM_GATEWAY_MODEL_CHEAP=unchanged-model\n" in persisted
+        assert "LLM_GATEWAY_BACKEND_SUMMARY=openrouter\n" in persisted
+        assert "LLM_GATEWAY_FALLBACK_ON_QUOTA=false\n" in persisted
+        assert "LLM_GATEWAY_MAX_BUDGET_USD=0.75\n" in persisted
+        assert "LLM_GATEWAY_CLAUDE_TIMEOUT_S=199\n" in persisted
+        assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+
+
+def test_config_put_rejects_unknown_and_invalid_values_without_changes() -> None:
+    invalid = [
+        ({"TYPO_BACKEND": "claude"}, "unknown config key"),
+        ({"BACKEND_CHEAP": "gemini"}, "claude or openrouter"),
+        ({"EFFORT_SUMMARY": "extreme"}, "must be one of"),
+        ({"MAX_BUDGET_USD": 0}, "positive number"),
+        ({"CLAUDE_TIMEOUT_S": 200}, "below agent-mem's 200s"),
+    ]
+    with isolated_config_env("# unchanged\n") as env_path:
+        client = TestClient(app)
+        before_values = config.editable_config()
+        for payload, detail in invalid:
+            response = client.put(
+                "/config", headers={"X-API-Key": config.API_KEY}, json=payload
+            )
+            assert response.status_code == 400, response.text
+            assert detail in response.json()["detail"]
+            assert config.editable_config() == before_values
+            assert env_path.read_text() == "# unchanged\n"
 
 
 if __name__ == "__main__":

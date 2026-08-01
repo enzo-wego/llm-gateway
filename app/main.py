@@ -211,6 +211,24 @@ async def usage() -> dict[str, Any]:
     return out
 
 
+@app.get("/config", dependencies=[Depends(require_key)])
+async def get_config() -> dict[str, Any]:
+    """Return the editable runtime knobs, never credentials or other secrets."""
+    return config.editable_config()
+
+
+@app.put("/config", dependencies=[Depends(require_key)])
+async def put_config(body: dict[str, Any]) -> dict[str, Any]:
+    """Validate and atomically persist a partial live configuration update."""
+    try:
+        return config.update_config(body)
+    except config.ConfigValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (OSError, RuntimeError) as exc:
+        log.exception("failed to persist gateway configuration")
+        raise HTTPException(status_code=500, detail="failed to persist gateway configuration") from exc
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     """Unauthenticated: it exposes no secrets and systemd/uptime checks need it."""

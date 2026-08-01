@@ -39,6 +39,8 @@ All routes except `/health` require `X-API-Key`.
 | `POST /generate` | seat or OpenRouter | `{system, user, tier: "summary"\|"cheap", schema?}` |
 | `POST /describe` | seat or OpenRouter | `{system, prompt, mime, data_b64, schema?}` |
 | `POST /embed` | OpenRouter always | `{texts: [...], dims}` |
+| `GET /config` | — | current editable, non-secret runtime configuration |
+| `PUT /config` | — | partial configuration update, applied live and persisted to `.env` |
 | `GET /health` | — | quota state, counters, active backends |
 
 Pass a JSON Schema as `schema` and the response contains a parsed `output`
@@ -46,6 +48,12 @@ object. Omit it and you get raw `text` back.
 
 Callers pick a **tier**, never a model name — that keeps model choice here (a
 restart) rather than in a consumer's deploy.
+
+`GET /config` and `PUT /config` require `X-API-Key`. The config response never
+contains service or provider credentials. Updates reject unknown keys and
+invalid values, rewrite only the supplied `.env` keys via an atomic rename, and
+take effect in the running process immediately. `LLM_GATEWAY_CLAUDE_TIMEOUT_S`
+must remain below agent-mem's 200-second client timeout.
 
 ## Every route has an off switch
 
