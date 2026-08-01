@@ -175,6 +175,42 @@ async def embed(body: EmbedIn) -> dict[str, Any]:
     return {"embeddings": vectors, "model": config.EMBED_MODEL, "dims": body.dims}
 
 
+@app.get("/usage", dependencies=[Depends(require_key)])
+async def usage() -> dict[str, Any]:
+    """Budget and quota in one place, for dashboards.
+
+    The OpenRouter key and the Claude seat both live in this process, so this is
+    the only place that can answer "how much is left" for either. agent-mem used
+    to hold the OpenRouter key purely to render this; it no longer does.
+
+    Authenticated, unlike /health: spend figures are not secret exactly, but they
+    are not something to hand to an unauthenticated caller either.
+    """
+    out: dict[str, Any] = {
+        "seat": {
+            "available": quota.seat_available(),
+            "last_rate_limit": quota.last,
+            "calls": quota.calls,
+            "notional_cost_usd": round(quota.cost_usd, 4),
+            "openrouter_fallbacks": quota.fallbacks,
+        },
+    }
+    try:
+        d = await openrouter.key_usage()
+        out["openrouter"] = {
+            "limit": d.get("limit"),
+            "usage": d.get("usage"),
+            "limit_remaining": d.get("limit_remaining"),
+            "usage_daily": d.get("usage_daily"),
+            "usage_monthly": d.get("usage_monthly"),
+        }
+    except openrouter.OpenRouterError as e:
+        # Report the failure instead of 500ing: the seat half is still useful,
+        # and a dashboard should show what it can.
+        out["openrouter"] = {"error": str(e)}
+    return out
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     """Unauthenticated: it exposes no secrets and systemd/uptime checks need it."""

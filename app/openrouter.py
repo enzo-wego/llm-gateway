@@ -118,3 +118,17 @@ async def embed(texts: list[str], dims: int) -> list[list[float]]:
             ordered[i] = row["embedding"]
         out.extend(ordered)
     return out
+
+
+async def key_usage() -> dict[str, Any]:
+    """Report the OpenRouter key's spend and remaining limit.
+
+    Lives here because this process is the only one holding the key. agent-mem
+    used to read it directly to render a budget widget; now it asks the gateway,
+    so the credential stays in one place and the dashboard keeps its visibility.
+    """
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(f"{config.OPENROUTER_BASE}/key", headers=_headers())
+    if r.status_code != 200:
+        raise OpenRouterError(f"key usage returned {r.status_code}: {r.text[:200]}")
+    return r.json().get("data") or {}
