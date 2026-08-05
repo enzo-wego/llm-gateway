@@ -1,0 +1,2 @@
+# The bind-mount source directory (./config -> /config) must exist in the repo.
+# The real config/.env is git-ignored and created per host at deploy time.

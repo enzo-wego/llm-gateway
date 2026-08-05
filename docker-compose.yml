@@ -1,0 +1,31 @@
+# Local (Mac, arm64) defaults. The VPS layers docker-compose.vps.yml on top of
+# this to add the shared agent-mem_default network and adjust the host publish.
+services:
+  llm-gateway:
+    build:
+      context: .
+    image: llm-gateway:latest
+    # Secrets and backend switches. env_file loads config/.env; the container
+    # never sees the host shell environment.
+    env_file: ./config/.env
+    environment:
+      # config.py reads LLM_GATEWAY_ENV_FILE; point it at the file *inside* the
+      # bind-mounted directory so PUT /config's atomic os.replace lands on a
+      # normal file, not onto a single-file mount point (which fails EBUSY).
+      LLM_GATEWAY_ENV_FILE: /config/.env
+      LLM_GATEWAY_HOST: 0.0.0.0
+    volumes:
+      # Mount the DIRECTORY, never ./config/.env:/config/.env — a file mount
+      # would break the rename-based persist in PUT /config.
+      - ./config:/config
+      # Claude CLI session state lives under $HOME (/home/app).
+      - claude-home:/home/app
+    # Loopback only. Host exposure is never 0.0.0.0 here.
+    ports:
+      - "127.0.0.1:8750:8750"
+    # Matches MemoryMax=2G in the systemd unit.
+    mem_limit: 2g
+    restart: unless-stopped
+
+volumes:
+  claude-home:

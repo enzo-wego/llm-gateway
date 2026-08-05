@@ -1,0 +1,23 @@
+# VPS override. Layered on docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --build
+#
+# Attaches the service to the pre-existing external network agent-mem_default so
+# the worker resolves the gateway by service DNS name (llm-gateway:8750). This
+# removes the need for the old 172.18.0.1 bridge binding and the ufw rule.
+services:
+  llm-gateway:
+    networks:
+      - agent-mem_default
+    # !override REPLACES the base port list instead of appending to it (plain
+    # merge would keep the base publish and end up publishing two ports). The
+    # committed steady state is 8750 — the cutover state, once the systemd unit
+    # is stopped and the container owns the port. During a side-by-side
+    # migration, while systemd still holds 8750, temporarily change this to
+    # "127.0.0.1:8751:8750" so both can run at once, then switch back to 8750
+    # at cutover.
+    ports: !override
+      - "127.0.0.1:8750:8750"
+
+networks:
+  agent-mem_default:
+    external: true
