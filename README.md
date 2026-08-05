@@ -120,9 +120,12 @@ cd /var/go/src/github.com/llm-gateway && git pull
 mkdir -p config && cp .env config/.env && chmod 600 config/.env
 ls -n config          # confirm 1001:1001 (the container's app user)
 
-# systemd still owns 8750; the container comes up on 8751 for side-by-side.
+# The committed override publishes 8750, so that port must be free first — on a
+# box still running the native service, stop it (validate side-by-side first if
+# you want; see below).
+sudo systemctl disable --now llm-gateway
 docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --build
-curl -s http://127.0.0.1:8751/health | jq '.ok, .seat'
+curl -s http://127.0.0.1:8750/health | jq '.ok, .seat'
 ```
 
 The VPS override attaches the container to the pre-existing `agent-mem_default`
@@ -136,14 +139,19 @@ docker run --rm --network agent-mem_default alpine:3 \
   wget -qO- http://llm-gateway:8750/health
 ```
 
-At cutover, stop the unit and move the host publish to `8750`:
+During a side-by-side migration — validating the container while the native
+service still holds 8750 — temporarily publish the container on 8751 instead.
+Change the `!override` publish in `docker-compose.vps.yml` to
+`127.0.0.1:8751:8750`, bring the stack up, and check `:8751`:
 
 ```bash
-sudo systemctl disable --now llm-gateway
-# edit docker-compose.vps.yml: 127.0.0.1:8751:8750 -> 127.0.0.1:8750:8750
-docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d
-curl -s http://127.0.0.1:8750/health | jq '.ok, .seat'
+docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --build
+curl -s http://127.0.0.1:8751/health | jq '.ok, .seat'
 ```
+
+Reachability by name is unaffected — the internal port stays 8750 on the shared
+network regardless of the host publish. Once satisfied, revert the publish to
+the committed `127.0.0.1:8750:8750` and run the cutover block above.
 
 `deploy/llm-gateway.service` and the `.venv` stay in place as a one-command
 rollback: `docker compose down && sudo systemctl enable --now llm-gateway`.
