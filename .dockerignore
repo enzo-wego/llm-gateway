@@ -1,0 +1,36 @@
+# Keep the build context to requirements.txt + app/. Everything below is either
+# secret, host/platform-specific, or irrelevant to the image.
+
+# Secrets and the runtime bind-mount source — never bake these into the image.
+.env
+.env.example
+config/
+
+# Host / platform-specific Python — the Claude binary is platform-specific and
+# MUST be pip-installed for the target platform, never copied from the host.
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Tooling, tests, docs, VCS — not needed at runtime.
+.git/
+.gitignore
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.code-review-graph/
+.omc/
+.claude/
+docs/
+deploy/
+test_gateway.py
+*.md
+
+# The packaging files themselves.
+.dockerignore
+Dockerfile
+docker-compose*.yml

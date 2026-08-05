@@ -109,54 +109,71 @@ Your Mac is already logged into Claude Code, so the seat path works immediately.
 
 ## VPS deployment
 
-Runs **native, not in Docker** — it needs the host's Claude CLI login.
+Runs as a **Docker container**. The old "native, not in Docker" requirement is
+gone: `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) is a headless
+credential passed by environment, so no interactive host login is needed.
 
 ```bash
-cd /var/go/src/github.com/llm-gateway
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cd /var/go/src/github.com/llm-gateway && git pull
 
-claude setup-token          # interactive, one-time — needs a human
-cp .env.example .env        # fill in secrets, incl. CLAUDE_CODE_OAUTH_TOKEN
-chmod 600 .env
+# config/ is a bind-mounted DIRECTORY, not a file — see gotcha 3 below.
+mkdir -p config && cp .env config/.env && chmod 600 config/.env
+ls -n config          # confirm 1001:1001 (the container's app user)
 
-sudo cp deploy/llm-gateway.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now llm-gateway
-curl -s http://172.18.0.1:8750/health
+# systemd still owns 8750; the container comes up on 8751 for side-by-side.
+docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --build
+curl -s http://127.0.0.1:8751/health | jq '.ok, .seat'
 ```
 
-Three things bite here, all found the hard way during the first deploy.
-
-**1 · The OAuth token must be in `.env`, not your shell.** `claude setup-token`
-gives you a token you probably exported in `~/.zshrc`. systemd does not read
-shell rc files, so the service starts unauthenticated unless
-`CLAUDE_CODE_OAUTH_TOKEN` is in the `EnvironmentFile`.
-
-**2 · Bind to the right bridge.** agent-mem's worker is in Docker, so the host's
-`127.0.0.1` is unreachable from it. Bind to the gateway of *the network the
-worker is actually on* — `agent-mem_default` is `172.18.0.1`, **not** the
-default `docker0` at `172.17.0.1`. Check with:
-
-```bash
-docker inspect $(docker ps --filter name=worker -q) \
-  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{$v.Gateway}}{{end}}'
-```
-
-**3 · ufw blocks container→host by default.** Binding correctly is not enough;
-the firewall drops it and `wget` just times out with no useful error. Open the
-subnet explicitly:
-
-```bash
-sudo ufw allow from 172.18.0.0/16 to any port 8750 proto tcp \
-  comment 'agent-mem worker -> llm-gateway'
-```
-
-Verify the whole path from inside the network, not just from the host — the host
-can reach a bound port that containers cannot:
+The VPS override attaches the container to the pre-existing `agent-mem_default`
+network, so agent-mem's worker reaches it by service name at
+`http://llm-gateway:8750/` — port 8750 is the container's internal port on the
+shared network, independent of the host publish. Verify that path from inside
+the network, not just from the host:
 
 ```bash
 docker run --rm --network agent-mem_default alpine:3 \
-  wget -qO- http://172.18.0.1:8750/health
+  wget -qO- http://llm-gateway:8750/health
 ```
+
+At cutover, stop the unit and move the host publish to `8750`:
+
+```bash
+sudo systemctl disable --now llm-gateway
+# edit docker-compose.vps.yml: 127.0.0.1:8751:8750 -> 127.0.0.1:8750:8750
+docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d
+curl -s http://127.0.0.1:8750/health | jq '.ok, .seat'
+```
+
+`deploy/llm-gateway.service` and the `.venv` stay in place as a one-command
+rollback: `docker compose down && sudo systemctl enable --now llm-gateway`.
+
+Three things bit the first (native) deploy. Only the first still applies.
+
+**1 · The OAuth token must be in the env file, not your shell.** `claude
+setup-token` gives you a token you probably exported in `~/.zshrc`. The
+container inherits nothing from your shell rc, so `CLAUDE_CODE_OAUTH_TOKEN` has
+to live in `config/.env` (loaded via `env_file`). Still true.
+
+**2 · Bridge-IP binding — no longer applies.** The native service had to bind
+the `agent-mem_default` gateway `172.18.0.1` because the worker could not reach
+the host loopback. On the shared network the worker resolves the container by
+DNS name, so the gateway binds `0.0.0.0` *inside* the container and no host
+bridge IP is involved.
+
+**3 · The ufw rule — no longer applies.** `sudo ufw allow from 172.18.0.0/16 to
+any port 8750 proto tcp` existed to let a container reach a host-bound port
+through the firewall. Container-to-container traffic on `agent-mem_default`
+never touches the host firewall, so the rule is now unnecessary. It is
+harmless; leave it in place.
+
+**4 · Mount `config/` as a directory, never `config/.env` as a file.** `PUT
+/config` persists with `os.replace(tmp, .env)`, an atomic rename. Renaming
+*onto* a single-file bind mount fails with `EBUSY` (the target is itself a
+mount point) and the endpoint returns HTTP 500 with the live value left
+untouched. Bind-mounting the parent directory (`./config:/config`, with
+`LLM_GATEWAY_ENV_FILE=/config/.env`) lets the rename land on a normal file
+inside the mount, so live-and-persist works exactly as it does natively.
 
 ## Status
 
