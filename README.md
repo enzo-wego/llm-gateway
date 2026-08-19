@@ -44,7 +44,10 @@ All routes except `/health` require `X-API-Key`.
 | `GET /health` | — | quota state, counters, active backends |
 
 Pass a JSON Schema as `schema` and the response contains a parsed `output`
-object. Omit it and you get raw `text` back.
+object. Omit it and you get raw `text` back. This holds on **both** backends —
+before, the OpenRouter path accepted `schema` and ignored it, so a backend
+switch or a quota fallback changed the response shape with nothing in the
+response saying so.
 
 Callers pick a **tier**, never a model name — that keeps model choice here (a
 restart) rather than in a consumer's deploy.
