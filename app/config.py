@@ -85,6 +85,17 @@ MODEL_CHEAP = os.getenv("LLM_GATEWAY_MODEL_CHEAP", "claude-haiku-4-5")
 OR_MODEL_SUMMARY = os.getenv("LLM_GATEWAY_OR_MODEL_SUMMARY", "google/gemini-3.6-flash")
 OR_MODEL_CHEAP = os.getenv("LLM_GATEWAY_OR_MODEL_CHEAP", "google/gemini-2.5-flash")
 
+# /describe has no tier, so its OpenRouter model was borrowed from the summary
+# tier while its Claude model came from the cheap one — the backend switch
+# silently changed model class. Naming it makes that explicit; the default
+# preserves the model every existing caller already gets.
+OR_MODEL_DESCRIBE = os.getenv("LLM_GATEWAY_OR_MODEL_DESCRIBE", OR_MODEL_SUMMARY)
+
+# Output ceiling for OpenRouter generation. The Claude path has no equivalent,
+# so a caller whose JSON answer exceeds this truncates on one backend and not
+# the other. 4096 is what the path always sent.
+OR_MAX_TOKENS = _int("LLM_GATEWAY_OR_MAX_TOKENS", 4096)
+
 EFFORT_SUMMARY = os.getenv("LLM_GATEWAY_EFFORT_SUMMARY", "medium")
 EFFORT_CHEAP = os.getenv("LLM_GATEWAY_EFFORT_CHEAP", "low")
 
@@ -134,6 +145,8 @@ EDITABLE_ENV_KEYS = {
     "MODEL_CHEAP": "LLM_GATEWAY_MODEL_CHEAP",
     "OR_MODEL_SUMMARY": "LLM_GATEWAY_OR_MODEL_SUMMARY",
     "OR_MODEL_CHEAP": "LLM_GATEWAY_OR_MODEL_CHEAP",
+    "OR_MODEL_DESCRIBE": "LLM_GATEWAY_OR_MODEL_DESCRIBE",
+    "OR_MAX_TOKENS": "LLM_GATEWAY_OR_MAX_TOKENS",
     "EFFORT_SUMMARY": "LLM_GATEWAY_EFFORT_SUMMARY",
     "EFFORT_CHEAP": "LLM_GATEWAY_EFFORT_CHEAP",
     "FALLBACK_ON_QUOTA": "LLM_GATEWAY_FALLBACK_ON_QUOTA",
@@ -143,7 +156,8 @@ EDITABLE_ENV_KEYS = {
 
 _BACKENDS = {"claude", "openrouter"}
 _EFFORTS = {"low", "medium", "high", "xhigh", "max"}
-_MODEL_KEYS = {"MODEL_SUMMARY", "MODEL_CHEAP", "OR_MODEL_SUMMARY", "OR_MODEL_CHEAP"}
+_MODEL_KEYS = {"MODEL_SUMMARY", "MODEL_CHEAP", "OR_MODEL_SUMMARY", "OR_MODEL_CHEAP",
+               "OR_MODEL_DESCRIBE"}
 _CONFIG_LOCK = threading.Lock()
 _ENV_ASSIGNMENT = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=).*$")
 
@@ -209,6 +223,8 @@ def _validate_updates(updates: dict[str, Any]) -> dict[str, Any]:
                 validated[name] = value.strip().lower() == "true"
             else:
                 raise ConfigValidationError(f"{name} must be true or false")
+        elif name == "OR_MAX_TOKENS":
+            validated[name] = _positive_int(name, value)
         elif name == "MAX_BUDGET_USD":
             validated[name] = _positive_float(name, value)
         elif name == "CLAUDE_TIMEOUT_S":

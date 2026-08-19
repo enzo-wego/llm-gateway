@@ -120,7 +120,9 @@ async def generate(body: GenerateIn) -> dict[str, Any]:
             log.error("claude failed (%s) — falling back to OpenRouter", e)
 
     try:
-        res = await openrouter.generate(system=body.system, user=body.user, model=ormodel)
+        res = await openrouter.generate(
+            system=body.system, user=body.user, model=ormodel, schema=body.schema_,
+        )
     except openrouter.OpenRouterError as e:
         raise HTTPException(502, str(e)) from e
     if backend == "claude":
@@ -154,7 +156,7 @@ async def describe(body: DescribeIn) -> dict[str, Any]:
     try:
         res = await openrouter.describe(
             prompt=body.prompt, mime=body.mime, data_b64=body.data_b64,
-            model=config.OR_MODEL_SUMMARY,
+            model=config.OR_MODEL_DESCRIBE, schema=body.schema_,
         )
     except openrouter.OpenRouterError as e:
         raise HTTPException(502, str(e)) from e
@@ -243,6 +245,7 @@ async def health() -> dict[str, Any]:
         "models": {
             "summary": config.MODEL_SUMMARY,
             "cheap": config.MODEL_CHEAP,
+            "describe": config.MODEL_CHEAP if config.BACKEND_DESCRIBE == "claude" else config.OR_MODEL_DESCRIBE,
             "embed": config.EMBED_MODEL,
         },
         "seat": {

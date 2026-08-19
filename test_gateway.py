@@ -243,6 +243,65 @@ def test_config_put_rejects_unknown_and_invalid_values_without_changes() -> None
             assert env_path.read_text() == "# unchanged\n"
 
 
+def test_openrouter_generate_honours_schema_and_returns_output() -> None:
+    """A schema request must come back as `output`, exactly as the Claude path does.
+
+    Before this, `schema` was accepted by the route and dropped here, so flipping
+    a backend — or a quota fallback firing — changed the response shape silently.
+    """
+    captured: dict = {}
+    original = openrouter._post
+
+    async def fake_post(path, payload, timeout):
+        captured["payload"] = payload
+        return {"choices": [{"message": {"content": '{"code":"13.1"}'}}], "usage": {}}
+
+    openrouter._post = fake_post
+    try:
+        schema = {"type": "object", "properties": {"code": {"type": "string"}}}
+        res = asyncio.run(openrouter.generate(system="s", user="u", model="m", schema=schema))
+        fmt = captured["payload"]["response_format"]
+        assert fmt["type"] == "json_schema", f"schema not forwarded: {fmt}"
+        assert fmt["json_schema"]["schema"] == schema
+        assert res["output"] == {"code": "13.1"}, f"no parsed output: {res}"
+        assert "text" not in res, "schema requests must not also return raw text"
+
+        # agent-mem sends no schema and reads only `text` — that must not change.
+        res = asyncio.run(openrouter.generate(system="s", user="u", model="m"))
+        assert captured["payload"]["response_format"] == {"type": "json_object"}
+        assert res["text"] == '{"code":"13.1"}' and "output" not in res
+    finally:
+        openrouter._post = original
+
+
+def test_openrouter_generate_max_tokens_is_configurable() -> None:
+    """The output ceiling must follow config, and default to the historical 4096."""
+    captured: dict = {}
+    original = openrouter._post
+    old = config.OR_MAX_TOKENS
+
+    async def fake_post(path, payload, timeout):
+        captured["max_tokens"] = payload["max_tokens"]
+        return {"choices": [{"message": {"content": "{}"}}]}
+
+    openrouter._post = fake_post
+    try:
+        assert old == 4096, f"default changed under agent-mem: {old}"
+        config.OR_MAX_TOKENS = 16384
+        asyncio.run(openrouter.generate(system="", user="u", model="m"))
+        assert captured["max_tokens"] == 16384, captured
+    finally:
+        config.OR_MAX_TOKENS = old
+        openrouter._post = original
+
+
+def test_describe_model_defaults_to_the_summary_tier() -> None:
+    """agent-mem's OCR quality rides on this default — it must not drop a tier."""
+    assert config.OR_MODEL_DESCRIBE == config.OR_MODEL_SUMMARY, (
+        f"describe model diverged from summary: {config.OR_MODEL_DESCRIBE}"
+    )
+
+
 if __name__ == "__main__":
     os.environ["ANTHROPIC_API_KEY"] = "sk-ant-should-be-stripped"
     import importlib

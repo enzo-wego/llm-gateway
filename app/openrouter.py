@@ -10,6 +10,7 @@ to "openrouter", or when the seat's quota is spent and FALLBACK_ON_QUOTA is on.
 It reproduces what agent-mem does today.
 """
 
+import json
 import logging
 from typing import Any
 
@@ -45,7 +46,38 @@ async def _post(path: str, payload: dict[str, Any], timeout: int) -> dict[str, A
     return data
 
 
-async def generate(*, system: str, user: str, model: str) -> dict[str, Any]:
+def _json_format(schema: dict[str, Any] | None) -> dict[str, Any]:
+    """Constrain the answer: the caller's schema when given, bare JSON otherwise.
+
+    Without the schema branch this path silently degraded a schema request to
+    json_object, so the SAME call returned ``output`` on the Claude backend and
+    only ``text`` here. A backend switch or a quota fallback then changed the
+    response shape under a caller that had no way to see it coming.
+    """
+    if schema is None:
+        return {"type": "json_object"}
+    return {"type": "json_schema",
+            "json_schema": {"name": "output", "strict": True, "schema": schema}}
+
+
+def _result(data: dict[str, Any], model: str, schema: dict[str, Any] | None, what: str) -> dict[str, Any]:
+    """Reduce a chat completion to claude.py's contract: output when schema, else text."""
+    choices = data.get("choices") or []
+    if not choices:
+        raise OpenRouterError(f"empty {what} response from OpenRouter")
+    text = choices[0]["message"]["content"]
+    meta = {"model": model, "usage": data.get("usage")}
+    if schema is None:
+        return {"text": text, "meta": meta}
+    try:
+        return {"output": json.loads(text), "meta": meta}
+    except (TypeError, ValueError) as e:
+        raise OpenRouterError(f"schema-constrained {what} was not JSON: {str(text)[:200]}") from e
+
+
+async def generate(
+    *, system: str, user: str, model: str, schema: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Chat completion, JSON-constrained, matching agent-mem's existing shape."""
     messages = []
     if system:
@@ -58,18 +90,17 @@ async def generate(*, system: str, user: str, model: str) -> dict[str, Any]:
             "model": model,
             "messages": messages,
             "temperature": 0.3,
-            "max_tokens": 4096,
-            "response_format": {"type": "json_object"},
+            "max_tokens": config.OR_MAX_TOKENS,
+            "response_format": _json_format(schema),
         },
         timeout=config.CLAUDE_TIMEOUT_S,
     )
-    choices = data.get("choices") or []
-    if not choices:
-        raise OpenRouterError("empty response from OpenRouter")
-    return {"text": choices[0]["message"]["content"], "meta": {"model": model, "usage": data.get("usage")}}
+    return _result(data, model, schema, "generate")
 
 
-async def describe(*, prompt: str, mime: str, data_b64: str, model: str) -> dict[str, Any]:
+async def describe(
+    *, prompt: str, mime: str, data_b64: str, model: str, schema: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Multimodal description via an image data URI, as agent-mem does today."""
     data = await _post(
         "/chat/completions",
@@ -81,14 +112,11 @@ async def describe(*, prompt: str, mime: str, data_b64: str, model: str) -> dict
             ]}],
             "temperature": 0.2,
             "max_tokens": 2048,
-            "response_format": {"type": "json_object"},
+            "response_format": _json_format(schema),
         },
         timeout=config.CLAUDE_TIMEOUT_S,
     )
-    choices = data.get("choices") or []
-    if not choices:
-        raise OpenRouterError("empty describe response from OpenRouter")
-    return {"text": choices[0]["message"]["content"], "meta": {"model": model, "usage": data.get("usage")}}
+    return _result(data, model, schema, "describe")
 
 
 async def embed(texts: list[str], dims: int) -> list[list[float]]:
