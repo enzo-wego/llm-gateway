@@ -96,6 +96,13 @@ OR_MODEL_DESCRIBE = os.getenv("LLM_GATEWAY_OR_MODEL_DESCRIBE", OR_MODEL_SUMMARY)
 # the other. 4096 is what the path always sent.
 OR_MAX_TOKENS = _int("LLM_GATEWAY_OR_MAX_TOKENS", 4096)
 
+# Output ceiling for OpenRouter /describe. Historically hard-coded at 2048 in
+# openrouter.describe, which truncated dense document pages (measured: full-page
+# booking tables hit exactly 2048 completion tokens). Give it its own knob so a
+# caller that needs verbatim extraction (payments-dispute-automation's parseEmail
+# page describe) can raise it, while agent-mem keeps today's 2048 by default.
+OR_MAX_TOKENS_DESCRIBE = _int("LLM_GATEWAY_OR_MAX_TOKENS_DESCRIBE", 2048)
+
 EFFORT_SUMMARY = os.getenv("LLM_GATEWAY_EFFORT_SUMMARY", "medium")
 EFFORT_CHEAP = os.getenv("LLM_GATEWAY_EFFORT_CHEAP", "low")
 
@@ -147,6 +154,7 @@ EDITABLE_ENV_KEYS = {
     "OR_MODEL_CHEAP": "LLM_GATEWAY_OR_MODEL_CHEAP",
     "OR_MODEL_DESCRIBE": "LLM_GATEWAY_OR_MODEL_DESCRIBE",
     "OR_MAX_TOKENS": "LLM_GATEWAY_OR_MAX_TOKENS",
+    "OR_MAX_TOKENS_DESCRIBE": "LLM_GATEWAY_OR_MAX_TOKENS_DESCRIBE",
     "EFFORT_SUMMARY": "LLM_GATEWAY_EFFORT_SUMMARY",
     "EFFORT_CHEAP": "LLM_GATEWAY_EFFORT_CHEAP",
     "FALLBACK_ON_QUOTA": "LLM_GATEWAY_FALLBACK_ON_QUOTA",
@@ -224,6 +232,8 @@ def _validate_updates(updates: dict[str, Any]) -> dict[str, Any]:
             else:
                 raise ConfigValidationError(f"{name} must be true or false")
         elif name == "OR_MAX_TOKENS":
+            validated[name] = _positive_int(name, value)
+        elif name == "OR_MAX_TOKENS_DESCRIBE":
             validated[name] = _positive_int(name, value)
         elif name == "MAX_BUDGET_USD":
             validated[name] = _positive_float(name, value)

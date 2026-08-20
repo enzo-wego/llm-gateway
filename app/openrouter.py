@@ -111,7 +111,7 @@ async def describe(
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data_b64}"}},
             ]}],
             "temperature": 0.2,
-            "max_tokens": 2048,
+            "max_tokens": config.OR_MAX_TOKENS_DESCRIBE,
             "response_format": _json_format(schema),
         },
         timeout=config.CLAUDE_TIMEOUT_S,
