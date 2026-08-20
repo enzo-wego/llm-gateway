@@ -60,13 +60,24 @@ def _json_format(schema: dict[str, Any] | None) -> dict[str, Any]:
             "json_schema": {"name": "output", "strict": True, "schema": schema}}
 
 
-def _result(data: dict[str, Any], model: str, schema: dict[str, Any] | None, what: str) -> dict[str, Any]:
+async def _result(data: dict[str, Any], model: str, schema: dict[str, Any] | None, what: str) -> dict[str, Any]:
     """Reduce a chat completion to claude.py's contract: output when schema, else text."""
     choices = data.get("choices") or []
     if not choices:
         raise OpenRouterError(f"empty {what} response from OpenRouter")
     text = choices[0]["message"]["content"]
     meta = {"model": model, "usage": data.get("usage")}
+    # finish_reason == "length" means the model hit max_tokens and the answer is
+    # cut off mid-stream — it still arrives as a valid 200 with plausible text, so
+    # nothing else distinguishes a clipped page from a complete one. Flag it in
+    # meta and raise it to Slack, but keep returning the (partial) text unchanged:
+    # a caller that ignores meta["truncated"] must behave exactly as it does today.
+    if choices[0].get("finish_reason") == "length":
+        meta["truncated"] = True
+        tokens = (data.get("usage") or {}).get("completion_tokens")
+        log.warning("%s response truncated at max_tokens (model=%s, completion_tokens=%s)",
+                    what, model, tokens)
+        await alerts.on_truncated(what, model, tokens)
     if schema is None:
         return {"text": text, "meta": meta}
     try:
@@ -95,7 +106,7 @@ async def generate(
         },
         timeout=config.CLAUDE_TIMEOUT_S,
     )
-    return _result(data, model, schema, "generate")
+    return await _result(data, model, schema, "generate")
 
 
 async def describe(
@@ -116,7 +127,7 @@ async def describe(
         },
         timeout=config.CLAUDE_TIMEOUT_S,
     )
-    return _result(data, model, schema, "describe")
+    return await _result(data, model, schema, "describe")
 
 
 async def embed(texts: list[str], dims: int) -> list[list[float]]:

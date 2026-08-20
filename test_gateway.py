@@ -324,6 +324,67 @@ def test_openrouter_describe_max_tokens_is_configurable() -> None:
         openrouter._post = original
 
 
+def test_truncation_sets_meta_only_on_length_finish() -> None:
+    """finish_reason == "length" flags meta["truncated"] and the partial text is
+    still returned; any other finish_reason (or none) must NOT add the key, so a
+    complete answer is never mistaken for a clipped one."""
+    original = openrouter._post
+
+    async def length_post(path, payload, timeout):
+        return {"choices": [{"message": {"content": "partial"}, "finish_reason": "length"}],
+                "usage": {"completion_tokens": 2048}}
+
+    async def stop_post(path, payload, timeout):
+        return {"choices": [{"message": {"content": "whole"}, "finish_reason": "stop"}],
+                "usage": {"completion_tokens": 12}}
+
+    async def no_finish_post(path, payload, timeout):
+        return {"choices": [{"message": {"content": "whole"}}], "usage": {"completion_tokens": 12}}
+
+    try:
+        openrouter._post = length_post
+        res = asyncio.run(openrouter.describe(prompt="p", mime="image/png", data_b64="Zg==", model="m"))
+        assert res["meta"]["truncated"] is True, res
+        assert res["text"] == "partial", "the partial text must still come back"
+
+        openrouter._post = stop_post
+        res = asyncio.run(openrouter.describe(prompt="p", mime="image/png", data_b64="Zg==", model="m"))
+        assert "truncated" not in res["meta"], f"a complete answer must not carry the key: {res}"
+
+        openrouter._post = no_finish_post
+        res = asyncio.run(openrouter.generate(system="", user="u", model="m"))
+        assert "truncated" not in res["meta"], f"absent finish_reason must not flag truncation: {res}"
+    finally:
+        openrouter._post = original
+
+
+def test_untruncated_result_is_byte_identical_to_pre_change() -> None:
+    """agent-mem ignores meta.truncated and reads only `text`. A response whose
+    finish_reason is not "length" must deep-equal the exact dict the pre-change
+    _result produced — text + meta{model, usage}, no truncated key anywhere — on
+    both the text branch (no schema) and the output branch (schema)."""
+    original = openrouter._post
+    usage = {"completion_tokens": 12, "prompt_tokens": 5}
+
+    async def complete_text(path, payload, timeout):
+        return {"choices": [{"message": {"content": "whole"}, "finish_reason": "stop"}], "usage": usage}
+
+    async def complete_json(path, payload, timeout):
+        # finish_reason absent — the exact historic shape agent-mem already sees.
+        return {"choices": [{"message": {"content": '{"code":"13.1"}'}}], "usage": usage}
+
+    try:
+        openrouter._post = complete_text
+        res = asyncio.run(openrouter.describe(prompt="p", mime="image/png", data_b64="Zg==", model="m"))
+        assert res == {"text": "whole", "meta": {"model": "m", "usage": usage}}, res
+
+        openrouter._post = complete_json
+        schema = {"type": "object", "properties": {"code": {"type": "string"}}}
+        res = asyncio.run(openrouter.generate(system="s", user="u", model="m", schema=schema))
+        assert res == {"output": {"code": "13.1"}, "meta": {"model": "m", "usage": usage}}, res
+    finally:
+        openrouter._post = original
+
 if __name__ == "__main__":
     os.environ["ANTHROPIC_API_KEY"] = "sk-ant-should-be-stripped"
     import importlib

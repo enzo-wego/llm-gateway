@@ -142,3 +142,24 @@ async def on_openrouter_error(status: int, body: str) -> None:
         await alert("openrouter:auth", f"*OpenRouter rejected the key* (HTTP {status}). Embeddings are down.")
     else:
         await alert(f"openrouter:{status}", f"OpenRouter returned HTTP {status}: `{body[:200]}`", critical=False)
+
+
+async def on_truncated(route: str, model: str, completion_tokens: int | None) -> None:
+    """Alert on an OpenRouter response cut off at max_tokens.
+
+    A "length" finish_reason returns a valid 200 with plausible but incomplete
+    text, so whatever consumes it (agent-mem's OCR, a downstream parse) can be
+    silently wrong. This is visibility, not an outage — the request still
+    succeeds — so it posts as a warning, deduped per (route, model) so a
+    truncating workload posts once per window, not once per request.
+    """
+    tokens = completion_tokens if completion_tokens is not None else "unknown"
+    cap = "OR_MAX_TOKENS_DESCRIBE" if route == "describe" else "OR_MAX_TOKENS"
+    await alert(
+        f"truncated:{route}:{model}",
+        f"*OpenRouter `/{route}` response truncated* at `max_tokens` "
+        f"(model `{model}`, {tokens} completion tokens). The answer is cut off "
+        f"mid-stream, so whatever consumes it may be silently wrong. Raise "
+        f"`{cap}` if this workload needs the full output.",
+        critical=False,
+    )
