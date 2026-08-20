@@ -302,6 +302,28 @@ def test_describe_model_defaults_to_the_summary_tier() -> None:
     )
 
 
+def test_openrouter_describe_max_tokens_is_configurable() -> None:
+    """describe had a hard-coded 2048 cap that truncated dense pages. It must now
+    follow config, and default to the historical 2048 so agent-mem is unaffected."""
+    captured: dict = {}
+    original = openrouter._post
+    old = config.OR_MAX_TOKENS_DESCRIBE
+
+    async def fake_post(path, payload, timeout):
+        captured["max_tokens"] = payload["max_tokens"]
+        return {"choices": [{"message": {"content": "{}"}}]}
+
+    openrouter._post = fake_post
+    try:
+        assert old == 2048, f"describe default changed under agent-mem: {old}"
+        config.OR_MAX_TOKENS_DESCRIBE = 8192
+        asyncio.run(openrouter.describe(prompt="p", mime="image/png", data_b64="Zg==", model="m"))
+        assert captured["max_tokens"] == 8192, captured
+    finally:
+        config.OR_MAX_TOKENS_DESCRIBE = old
+        openrouter._post = original
+
+
 if __name__ == "__main__":
     os.environ["ANTHROPIC_API_KEY"] = "sk-ant-should-be-stripped"
     import importlib
