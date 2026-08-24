@@ -124,7 +124,7 @@ async def generate(body: GenerateIn) -> dict[str, Any]:
                     status = 503
                     raise HTTPException(503, f"seat quota exhausted ({e})") from e
             except claude.ClaudeError as e:
-                reason = "claude_error"
+                reason = e.reason
                 if not config.FALLBACK_ON_QUOTA:
                     status = 502
                     raise HTTPException(502, str(e)) from e
