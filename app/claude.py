@@ -146,6 +146,11 @@ async def _guarded(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, An
     """_run with a wall-clock cap — the SDK spawns a subprocess that can hang."""
     try:
         return await asyncio.wait_for(_run(prompt, options), timeout=config.CLAUDE_TIMEOUT_S)
+    except asyncio.CancelledError as e:
+        task = asyncio.current_task()
+        if task is None or task.cancelling():
+            raise
+        raise ClaudeError(f"timed out after {config.CLAUDE_TIMEOUT_S}s") from e
     except TimeoutError as e:
         raise ClaudeError(f"timed out after {config.CLAUDE_TIMEOUT_S}s") from e
 

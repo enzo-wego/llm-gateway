@@ -6,6 +6,7 @@ of in a Go deploy, and it is what makes the Claude experiment reversible
 without touching agent-mem's gemini client at all.
 """
 
+import asyncio
 import logging
 import time
 from typing import Any, Literal
@@ -99,35 +100,71 @@ def _tier_config(tier: Tier) -> tuple[str, str, str, str]:
 # ── routes ───────────────────────────────────────────────────────────────────
 @app.post("/generate", dependencies=[Depends(require_key)])
 async def generate(body: GenerateIn) -> dict[str, Any]:
+    started = time.monotonic()
     backend, cmodel, ormodel, effort = _tier_config(body.tier)
-
-    if backend == "claude" and quota.seat_available():
-        try:
-            res = await claude.generate(
-                system=body.system, user=body.user, model=cmodel,
-                effort=effort, schema=body.schema_,
-            )
-            quota.record(res["meta"])
-            return {"backend": "claude", **res}
-        except claude.QuotaExhausted as e:
-            quota.note_rejection((quota.last or {}).get("resets_at"))
-            if not config.FALLBACK_ON_QUOTA:
-                raise HTTPException(503, f"seat quota exhausted ({e})") from e
-            log.warning("seat quota exhausted (%s) — falling back to OpenRouter", e)
-        except claude.ClaudeError as e:
-            if not config.FALLBACK_ON_QUOTA:
-                raise HTTPException(502, str(e)) from e
-            log.error("claude failed (%s) — falling back to OpenRouter", e)
+    actual_backend = backend
+    actual_model = cmodel if backend == "claude" else ormodel
+    status: int | str = 500
+    reason = "none"
 
     try:
-        res = await openrouter.generate(
-            system=body.system, user=body.user, model=ormodel, schema=body.schema_,
+        if backend == "claude" and quota.seat_available():
+            try:
+                res = await claude.generate(
+                    system=body.system, user=body.user, model=cmodel,
+                    effort=effort, schema=body.schema_,
+                )
+                quota.record(res["meta"])
+                status = 200
+                return {"backend": "claude", **res}
+            except claude.QuotaExhausted as e:
+                reason = "quota_exhausted"
+                quota.note_rejection((quota.last or {}).get("resets_at"))
+                if not config.FALLBACK_ON_QUOTA:
+                    status = 503
+                    raise HTTPException(503, f"seat quota exhausted ({e})") from e
+            except claude.ClaudeError as e:
+                reason = "claude_error"
+                if not config.FALLBACK_ON_QUOTA:
+                    status = 502
+                    raise HTTPException(502, str(e)) from e
+
+        if backend == "claude" and reason == "none":
+            reason = "seat_unavailable"
+        actual_backend = "openrouter"
+        actual_model = ormodel
+        try:
+            res = await openrouter.generate(
+                system=body.system, user=body.user, model=ormodel, schema=body.schema_,
+            )
+        except openrouter.OpenRouterError as e:
+            reason = "openrouter_error"
+            status = 502
+            raise HTTPException(502, str(e)) from e
+        if backend == "claude":
+            quota.fallbacks += 1
+        status = 200
+        return {"backend": "openrouter", **res}
+    except asyncio.CancelledError:
+        status = "cancelled"
+        reason = "external_cancelled"
+        raise
+    except Exception:
+        if reason == "none":
+            reason = "unexpected_error"
+        raise
+    finally:
+        duration_ms = int((time.monotonic() - started) * 1000)
+        level = (
+            logging.ERROR
+            if isinstance(status, int) and status >= 500
+            else logging.WARNING if reason != "none" else logging.INFO
         )
-    except openrouter.OpenRouterError as e:
-        raise HTTPException(502, str(e)) from e
-    if backend == "claude":
-        quota.fallbacks += 1
-    return {"backend": "openrouter", **res}
+        log.log(
+            level,
+            "generate tier=%s backend=%s model=%s effort=%s status=%s reason=%s duration_ms=%d",
+            body.tier, actual_backend, actual_model, effort, status, reason, duration_ms,
+        )
 
 
 @app.post("/describe", dependencies=[Depends(require_key)])

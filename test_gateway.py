@@ -16,6 +16,7 @@ backend 502s. These two do not:
 """
 
 import asyncio
+import logging
 from contextlib import contextmanager
 import os
 from pathlib import Path
@@ -26,9 +27,8 @@ import tempfile
 os.environ.setdefault("LLM_GATEWAY_API_KEY", "test")
 os.environ.setdefault("OPENROUTER_API_KEY", "sk-or-test")
 
-from app import claude, openrouter  # noqa: E402
+from app import claude, config, main, openrouter  # noqa: E402
 from app.main import _Quota, _tier_config, app  # noqa: E402
-from app import config  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 
@@ -48,6 +48,25 @@ def isolated_config_env(initial: str):
             for name, value in old_values.items():
                 setattr(config, name, value)
             config.ENV_FILE = old_path
+
+
+@contextmanager
+def captured_gateway_logs():
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = Capture()
+    original_level = main.log.level
+    main.log.setLevel(logging.INFO)
+    main.log.addHandler(handler)
+    try:
+        yield records
+    finally:
+        main.log.removeHandler(handler)
+        main.log.setLevel(original_level)
 
 
 def test_claude_unwraps_entire_fenced_block() -> None:
@@ -384,6 +403,250 @@ def test_untruncated_result_is_byte_identical_to_pre_change() -> None:
         assert res == {"output": {"code": "13.1"}, "meta": {"model": "m", "usage": usage}}, res
     finally:
         openrouter._post = original
+
+def test_guarded_converts_deadline_cancellation_to_claude_error() -> None:
+    original = claude._run
+
+    async def deadline_exceeded(prompt, options):
+        raise asyncio.CancelledError("deadline exceeded")
+
+    async def check() -> None:
+        claude._run = deadline_exceeded
+        try:
+            try:
+                await claude._guarded("prompt", None)
+            except claude.ClaudeError as exc:
+                assert str(exc) == f"timed out after {config.CLAUDE_TIMEOUT_S}s"
+            except asyncio.CancelledError as exc:
+                raise AssertionError("deadline cancellation escaped _guarded") from exc
+            else:
+                raise AssertionError("deadline cancellation was accepted")
+        finally:
+            claude._run = original
+
+    asyncio.run(check())
+
+
+def test_guarded_propagates_external_cancellation() -> None:
+    original = claude._run
+
+    async def check() -> None:
+        started = asyncio.Event()
+
+        async def blocked(prompt, options):
+            started.set()
+            await asyncio.Event().wait()
+
+        claude._run = blocked
+        task = asyncio.create_task(claude._guarded("prompt", None))
+        try:
+            await started.wait()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return
+            except claude.ClaudeError as exc:
+                raise AssertionError("external cancellation became ClaudeError") from exc
+            raise AssertionError("external cancellation was swallowed")
+        finally:
+            claude._run = original
+            if not task.done():
+                task.cancel()
+
+    asyncio.run(check())
+
+
+def test_generate_deadline_returns_classified_502() -> None:
+    original_run = claude._run
+    original_config = (config.BACKEND_CHEAP, config.FALLBACK_ON_QUOTA)
+    original_blocked_until = main.quota.blocked_until
+
+    async def deadline_exceeded(prompt, options):
+        raise asyncio.CancelledError("deadline exceeded")
+
+    try:
+        claude._run = deadline_exceeded
+        config.BACKEND_CHEAP = "claude"
+        config.FALLBACK_ON_QUOTA = False
+        main.quota.blocked_until = 0
+        response = TestClient(app, raise_server_exceptions=False).post(
+            "/generate",
+            headers={"X-API-Key": config.API_KEY},
+            json={"user": "prompt", "tier": "cheap"},
+        )
+        assert response.status_code == 502, response.text
+        assert response.json()["detail"] == f"timed out after {config.CLAUDE_TIMEOUT_S}s"
+    finally:
+        claude._run = original_run
+        config.BACKEND_CHEAP, config.FALLBACK_ON_QUOTA = original_config
+        main.quota.blocked_until = original_blocked_until
+
+
+def test_generate_logs_duration_and_request_metadata() -> None:
+    original_generate = claude.generate
+    original_quota = main.quota
+    original_config = (
+        config.BACKEND_CHEAP,
+        config.MODEL_CHEAP,
+        config.EFFORT_CHEAP,
+        config.FALLBACK_ON_QUOTA,
+    )
+
+    async def generated(**kwargs):
+        return {"text": "ok", "meta": {}}
+
+    try:
+        claude.generate = generated
+        main.quota = _Quota()
+        config.BACKEND_CHEAP = "claude"
+        config.MODEL_CHEAP = "test-model"
+        config.EFFORT_CHEAP = "low"
+        config.FALLBACK_ON_QUOTA = False
+
+        with captured_gateway_logs() as records:
+            response = TestClient(app).post(
+                "/generate",
+                headers={"X-API-Key": config.API_KEY},
+                json={"user": "prompt", "tier": "cheap"},
+            )
+        assert response.status_code == 200, response.text
+
+        messages = [record.getMessage() for record in records]
+        assert len(messages) == 1, messages
+        message = messages[0]
+        assert "tier=cheap" in message
+        assert "backend=claude" in message
+        assert "model=test-model" in message
+        assert "effort=low" in message
+        assert "status=200" in message
+        duration = next(part for part in message.split() if part.startswith("duration_ms="))
+        assert duration.removeprefix("duration_ms=").isdigit(), message
+    finally:
+        claude.generate = original_generate
+        main.quota = original_quota
+        (
+            config.BACKEND_CHEAP,
+            config.MODEL_CHEAP,
+            config.EFFORT_CHEAP,
+            config.FALLBACK_ON_QUOTA,
+        ) = original_config
+
+
+def test_generate_logs_each_outcome_once() -> None:
+    original_claude_generate = claude.generate
+    original_openrouter_generate = openrouter.generate
+    original_quota = main.quota
+    original_config = (
+        config.BACKEND_CHEAP,
+        config.MODEL_CHEAP,
+        config.OR_MODEL_CHEAP,
+        config.EFFORT_CHEAP,
+        config.FALLBACK_ON_QUOTA,
+    )
+
+    async def claude_failed(**kwargs):
+        raise claude.ClaudeError("failed")
+
+    async def openrouter_generated(**kwargs):
+        return {"text": "ok", "meta": {}}
+
+    async def openrouter_failed(**kwargs):
+        raise openrouter.OpenRouterError("failed")
+
+    def assert_log(records: list[logging.LogRecord], *fields: str) -> None:
+        messages = [record.getMessage() for record in records]
+        assert len(messages) == 1, messages
+        message = messages[0]
+        assert "tier=cheap" in message
+        assert "effort=low" in message
+        for field in fields:
+            assert field in message
+        duration = next(part for part in message.split() if part.startswith("duration_ms="))
+        assert duration.removeprefix("duration_ms=").isdigit(), message
+
+    try:
+        main.quota = _Quota()
+        config.BACKEND_CHEAP = "claude"
+        config.MODEL_CHEAP = "claude-model"
+        config.OR_MODEL_CHEAP = "openrouter-model"
+        config.EFFORT_CHEAP = "low"
+        config.FALLBACK_ON_QUOTA = True
+        claude.generate = claude_failed
+        openrouter.generate = openrouter_generated
+
+        with captured_gateway_logs() as records:
+            response = TestClient(app).post(
+                "/generate",
+                headers={"X-API-Key": config.API_KEY},
+                json={"user": "prompt", "tier": "cheap"},
+            )
+        assert response.status_code == 200, response.text
+        assert_log(
+            records,
+            "backend=openrouter",
+            "model=openrouter-model",
+            "status=200",
+            "reason=claude_error",
+        )
+
+        config.BACKEND_CHEAP = "openrouter"
+        openrouter.generate = openrouter_failed
+        with captured_gateway_logs() as records:
+            response = TestClient(app).post(
+                "/generate",
+                headers={"X-API-Key": config.API_KEY},
+                json={"user": "prompt", "tier": "cheap"},
+            )
+        assert response.status_code == 502, response.text
+        assert_log(
+            records,
+            "backend=openrouter",
+            "model=openrouter-model",
+            "status=502",
+            "reason=openrouter_error",
+        )
+
+        started = asyncio.Event()
+
+        async def blocked(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        async def cancel_generate() -> None:
+            claude.generate = blocked
+            config.BACKEND_CHEAP = "claude"
+            config.FALLBACK_ON_QUOTA = False
+            task = asyncio.create_task(main.generate(main.GenerateIn(user="prompt", tier="cheap")))
+            await started.wait()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return
+            raise AssertionError("external cancellation was swallowed")
+
+        with captured_gateway_logs() as records:
+            asyncio.run(cancel_generate())
+        assert_log(
+            records,
+            "backend=claude",
+            "model=claude-model",
+            "status=cancelled",
+            "reason=external_cancelled",
+        )
+    finally:
+        claude.generate = original_claude_generate
+        openrouter.generate = original_openrouter_generate
+        main.quota = original_quota
+        (
+            config.BACKEND_CHEAP,
+            config.MODEL_CHEAP,
+            config.OR_MODEL_CHEAP,
+            config.EFFORT_CHEAP,
+            config.FALLBACK_ON_QUOTA,
+        ) = original_config
+
 
 if __name__ == "__main__":
     os.environ["ANTHROPIC_API_KEY"] = "sk-ant-should-be-stripped"
