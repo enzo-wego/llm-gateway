@@ -33,11 +33,20 @@ class QuotaExhausted(RuntimeError):
 class ClaudeError(RuntimeError):
     """Terminal, non-quota failure (auth expired, billing, CLI crash)."""
 
+    def __init__(self, message: str, *, reason: str = "claude_error"):
+        super().__init__(message)
+        self.reason = reason
+
 
 # Structured output is delivered as an internal tool call, so a single-turn cap
 # truncates it — an observed run used 2 turns for a trivial prompt. Four leaves
 # headroom without letting a misbehaving call loop.
 _MAX_TURNS = 4
+# The bundled CLI peaked at 319.7 MiB RSS in production. Four processes plus
+# the 86.3 MiB service baseline use 1,365.1 MiB of the 2 GiB cgroup, leaving
+# 682.9 MiB for shared/runtime overhead and transient spikes.
+_MAX_CONCURRENT_QUERIES = 4
+_query_slots = asyncio.Semaphore(_MAX_CONCURRENT_QUERIES)
 
 
 def _unwrap_fenced_block(text: str) -> str:
@@ -77,6 +86,40 @@ def _options(model: str, effort: str, system: str, schema: dict[str, Any] | None
     )
 
 
+async def _disconnect(client: sdk.ClaudeSDKClient) -> None:
+    """Finish subprocess cleanup before propagating caller cancellation."""
+    cleanup = asyncio.create_task(client.disconnect())
+    cancellation: asyncio.CancelledError | None = None
+    cleanup_error: Exception | None = None
+
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError as e:
+            cancellation = e
+        except Exception as e:
+            cleanup_error = e
+            break
+
+    if cleanup_error is None:
+        try:
+            cleanup.result()
+        except asyncio.CancelledError as e:
+            cancellation = cancellation or e
+        except Exception as e:
+            cleanup_error = e
+
+    if cancellation is not None:
+        if cleanup_error is not None:
+            log.error(
+                "Claude subprocess cleanup failed during cancellation: %s",
+                cleanup_error,
+            )
+        raise cancellation
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
 async def _run(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, Any]:
     """Drive one query to completion and reduce the message stream to a result.
 
@@ -91,41 +134,68 @@ async def _run(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, Any]:
     fatal: str | None = None
     quota_rejected = False
 
-    async for msg in sdk.query(prompt=prompt, options=options):
-        kind = type(msg).__name__
+    async with _query_slots:
+        client = sdk.ClaudeSDKClient(options)
+        try:
+            try:
+                await client.connect(prompt)
+            except sdk.ClaudeSDKError:
+                raise
+            except Exception as e:
+                raise ClaudeError(str(e), reason="sdk_connect_error") from e
+            messages = client.receive_response()
+            while True:
+                try:
+                    msg = await anext(messages)
+                except StopAsyncIteration:
+                    break
+                except sdk.ClaudeSDKError:
+                    raise
+                except Exception as e:
+                    # SDK 0.2.128 turns runtime ProcessError instances into a
+                    # plain Exception before exposing them to consumers.
+                    raise ClaudeError(str(e), reason="sdk_query_error") from e
 
-        if kind == "RateLimitEvent":
-            info = msg.rate_limit_info
-            meta["rate_limit"] = {
-                "type": getattr(info, "rate_limit_type", None),
-                "status": getattr(info, "status", None),
-                "utilization": getattr(info, "utilization", None),
-                "resets_at": getattr(info, "resets_at", None),
-            }
-            if getattr(info, "status", None) == "rejected":
-                quota_rejected = True
-            await alerts.on_rate_limit(info)
+                kind = type(msg).__name__
 
-        elif kind == "AssistantMessage":
-            if msg.error:
-                fatal = msg.error
-                await alerts.on_claude_error(msg.error)
-            for block in msg.content:
-                if getattr(block, "text", None):
-                    text_parts.append(block.text)
+                if kind == "RateLimitEvent":
+                    info = msg.rate_limit_info
+                    meta["rate_limit"] = {
+                        "type": getattr(info, "rate_limit_type", None),
+                        "status": getattr(info, "status", None),
+                        "utilization": getattr(info, "utilization", None),
+                        "resets_at": getattr(info, "resets_at", None),
+                    }
+                    if getattr(info, "status", None) == "rejected":
+                        quota_rejected = True
+                    await alerts.on_rate_limit(info)
 
-        elif kind == "ResultMessage":
-            structured = msg.structured_output
-            meta.update(
-                cost_usd=msg.total_cost_usd,
-                usage=msg.usage,
-                stop_reason=msg.stop_reason,
-                duration_ms=msg.duration_ms,
-                num_turns=msg.num_turns,
-                model=options.model,
-            )
-            if msg.is_error:
-                fatal = fatal or (msg.errors[0] if msg.errors else "unknown_error")
+                elif kind == "AssistantMessage":
+                    if msg.error:
+                        fatal = msg.error
+                        await alerts.on_claude_error(msg.error)
+                    for block in msg.content:
+                        if getattr(block, "text", None):
+                            text_parts.append(block.text)
+
+                elif kind == "ResultMessage":
+                    structured = msg.structured_output
+                    meta.update(
+                        cost_usd=msg.total_cost_usd,
+                        usage=msg.usage,
+                        stop_reason=msg.stop_reason,
+                        duration_ms=msg.duration_ms,
+                        num_turns=msg.num_turns,
+                        model=options.model,
+                    )
+                    if msg.is_error:
+                        fatal = fatal or (
+                            msg.errors[0] if msg.errors else "unknown_error"
+                        )
+        finally:
+            # Release the semaphore only after the CLI has been reaped, even
+            # when raw asyncio cancellation arrives during disconnect().
+            await _disconnect(client)
 
     if quota_rejected:
         raise QuotaExhausted(meta.get("rate_limit", {}).get("type") or "quota")
@@ -153,6 +223,9 @@ async def _guarded(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, An
         raise ClaudeError(f"timed out after {config.CLAUDE_TIMEOUT_S}s") from e
     except TimeoutError as e:
         raise ClaudeError(f"timed out after {config.CLAUDE_TIMEOUT_S}s") from e
+    except sdk.ClaudeSDKError as e:
+        failure = type(e).__name__.removesuffix("Error").lower()
+        raise ClaudeError(str(e), reason=f"sdk_{failure}_error") from e
 
 
 async def generate(

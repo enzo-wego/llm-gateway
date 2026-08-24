@@ -456,6 +456,182 @@ def test_guarded_propagates_external_cancellation() -> None:
 
     asyncio.run(check())
 
+def test_run_waits_before_spawning_fifth_query() -> None:
+    original_client = claude.sdk.ClaudeSDKClient
+    original_slots = claude._query_slots
+
+    async def check() -> None:
+        started: list[str] = []
+        four_started = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockedClient:
+            def __init__(self, options):
+                pass
+
+            async def connect(self, prompt):
+                started.append(prompt)
+                if len(started) == 4:
+                    four_started.set()
+
+            async def receive_response(self):
+                await release.wait()
+                if False:
+                    yield None
+
+            async def disconnect(self):
+                pass
+
+        claude.sdk.ClaudeSDKClient = BlockedClient
+        claude._query_slots = asyncio.Semaphore(4)
+        tasks = [
+            asyncio.create_task(claude._run(str(index), None))
+            for index in range(5)
+        ]
+        try:
+            await asyncio.wait_for(four_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert started == ["0", "1", "2", "3"], started
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            assert started == ["0", "1", "2", "3", "4"], started
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            claude.sdk.ClaudeSDKClient = original_client
+            claude._query_slots = original_slots
+
+    asyncio.run(check())
+
+def test_cancelled_query_holds_slot_until_subprocess_cleanup() -> None:
+    original_client = claude.sdk.ClaudeSDKClient
+    original_query = claude.sdk.query
+    original_alert = claude.alerts.on_rate_limit
+    original_slots = claude._query_slots
+
+    async def check() -> None:
+        started: list[str] = []
+        four_started = asyncio.Event()
+        fifth_started = asyncio.Event()
+        alert_release = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+
+        class RateLimitEvent:
+            rate_limit_info = type("RateLimitInfo", (), {"status": None})()
+
+        class FakeClient:
+            def __init__(self, options):
+                self.prompt = ""
+
+            async def connect(self, prompt):
+                self.prompt = prompt
+                started.append(prompt)
+                if len(started) == 4:
+                    four_started.set()
+                elif len(started) == 5:
+                    fifth_started.set()
+
+            async def receive_response(self):
+                yield RateLimitEvent()
+
+            async def disconnect(self):
+                cleanup_started.set()
+                await cleanup_release.wait()
+
+        async def shortcut_must_not_run(**kwargs):
+            if False:
+                yield None
+            raise AssertionError("sdk.query does not expose deterministic cleanup")
+
+        async def blocked_alert(info):
+            await alert_release.wait()
+
+        claude.sdk.ClaudeSDKClient = FakeClient
+        claude.sdk.query = shortcut_must_not_run
+        claude.alerts.on_rate_limit = blocked_alert
+        claude._query_slots = asyncio.Semaphore(4)
+        tasks = [
+            asyncio.create_task(claude._run(str(index), None))
+            for index in range(5)
+        ]
+        try:
+            await asyncio.wait_for(four_started.wait(), timeout=1)
+            tasks[0].cancel()
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert started == ["0", "1", "2", "3"], started
+            cleanup_release.set()
+            await asyncio.wait_for(fifth_started.wait(), timeout=1)
+            alert_release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            alert_release.set()
+            cleanup_release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            claude.sdk.ClaudeSDKClient = original_client
+            claude.sdk.query = original_query
+            claude.alerts.on_rate_limit = original_alert
+            claude._query_slots = original_slots
+
+    asyncio.run(check())
+
+def test_cancellation_during_cleanup_keeps_query_slot() -> None:
+    original_client = claude.sdk.ClaudeSDKClient
+    original_slots = claude._query_slots
+
+    async def check() -> None:
+        started: list[str] = []
+        four_cleaning = asyncio.Event()
+        fifth_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        cleaning = 0
+
+        class FakeClient:
+            def __init__(self, options):
+                pass
+
+            async def connect(self, prompt):
+                started.append(prompt)
+                if len(started) == 5:
+                    fifth_started.set()
+
+            async def receive_response(self):
+                if False:
+                    yield None
+
+            async def disconnect(self):
+                nonlocal cleaning
+                cleaning += 1
+                if cleaning == 4:
+                    four_cleaning.set()
+                await cleanup_release.wait()
+
+        claude.sdk.ClaudeSDKClient = FakeClient
+        claude._query_slots = asyncio.Semaphore(4)
+        tasks = [
+            asyncio.create_task(claude._run(str(index), None))
+            for index in range(5)
+        ]
+        try:
+            await asyncio.wait_for(four_cleaning.wait(), timeout=1)
+            tasks[0].cancel()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert not tasks[0].done(), "cancellation escaped subprocess cleanup"
+            assert not fifth_started.is_set(), started
+            cleanup_release.set()
+            await asyncio.wait_for(fifth_started.wait(), timeout=1)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            assert isinstance(results[0], asyncio.CancelledError), results[0]
+        finally:
+            cleanup_release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            claude.sdk.ClaudeSDKClient = original_client
+            claude._query_slots = original_slots
+
+    asyncio.run(check())
+
 
 def test_generate_deadline_returns_classified_502() -> None:
     original_run = claude._run
@@ -481,6 +657,145 @@ def test_generate_deadline_returns_classified_502() -> None:
         claude._run = original_run
         config.BACKEND_CHEAP, config.FALLBACK_ON_QUOTA = original_config
         main.quota.blocked_until = original_blocked_until
+
+def test_generate_process_error_returns_classified_502() -> None:
+    original_client = claude.sdk.ClaudeSDKClient
+    original_query = claude.sdk.query
+    original_quota = main.quota
+    original_config = (config.BACKEND_CHEAP, config.FALLBACK_ON_QUOTA)
+
+    class ProcessFailedClient:
+        def __init__(self, options):
+            pass
+
+        async def connect(self, prompt):
+            raise claude.sdk.ProcessError("Command failed", exit_code=-9)
+
+        async def disconnect(self):
+            pass
+
+    async def shortcut_must_not_run(**kwargs):
+        if False:
+            yield None
+        raise AssertionError("sdk.query does not expose deterministic cleanup")
+
+    try:
+        claude.sdk.ClaudeSDKClient = ProcessFailedClient
+        claude.sdk.query = shortcut_must_not_run
+        main.quota = _Quota()
+        config.BACKEND_CHEAP = "claude"
+        config.FALLBACK_ON_QUOTA = False
+
+        with captured_gateway_logs() as records:
+            response = TestClient(app, raise_server_exceptions=False).post(
+                "/generate",
+                headers={"X-API-Key": config.API_KEY},
+                json={"user": "prompt", "tier": "cheap"},
+            )
+
+        assert response.status_code == 502, response.text
+        assert response.json()["detail"] == "Command failed (exit code: -9)"
+        messages = [record.getMessage() for record in records]
+        assert len(messages) == 1, messages
+        assert "status=502" in messages[0]
+        assert "reason=sdk_process_error" in messages[0]
+    finally:
+        claude.sdk.ClaudeSDKClient = original_client
+        claude.sdk.query = original_query
+        main.quota = original_quota
+        config.BACKEND_CHEAP, config.FALLBACK_ON_QUOTA = original_config
+
+def test_generate_sdk_connect_error_returns_classified_502() -> None:
+    original_client = claude.sdk.ClaudeSDKClient
+    original_quota = main.quota
+    original_config = (config.BACKEND_CHEAP, config.FALLBACK_ON_QUOTA)
+
+    class ConnectFailedClient:
+        def __init__(self, options):
+            pass
+
+        async def connect(self, prompt):
+            raise Exception("Control request timeout: initialize")
+
+        async def disconnect(self):
+            pass
+
+    try:
+        claude.sdk.ClaudeSDKClient = ConnectFailedClient
+        main.quota = _Quota()
+        config.BACKEND_CHEAP = "claude"
+        config.FALLBACK_ON_QUOTA = False
+
+        with captured_gateway_logs() as records:
+            response = TestClient(app, raise_server_exceptions=False).post(
+                "/generate",
+                headers={"X-API-Key": config.API_KEY},
+                json={"user": "prompt", "tier": "cheap"},
+            )
+
+        assert response.status_code == 502, response.text
+        assert response.json()["detail"] == "Control request timeout: initialize"
+        messages = [record.getMessage() for record in records]
+        assert len(messages) == 1, messages
+        assert "status=502" in messages[0]
+        assert "reason=sdk_connect_error" in messages[0]
+    finally:
+        claude.sdk.ClaudeSDKClient = original_client
+        main.quota = original_quota
+        config.BACKEND_CHEAP, config.FALLBACK_ON_QUOTA = original_config
+
+
+def test_generate_sdk_runtime_error_returns_classified_502() -> None:
+    original_client = claude.sdk.ClaudeSDKClient
+    original_query = claude.sdk.query
+    original_quota = main.quota
+    original_config = (config.BACKEND_CHEAP, config.FALLBACK_ON_QUOTA)
+
+    class RuntimeFailedClient:
+        def __init__(self, options):
+            pass
+
+        async def connect(self, prompt):
+            pass
+
+        async def receive_response(self):
+            if False:
+                yield None
+            raise Exception("Command failed with exit code -9")
+
+        async def disconnect(self):
+            pass
+
+    async def shortcut_must_not_run(**kwargs):
+        if False:
+            yield None
+        raise AssertionError("sdk.query does not expose deterministic cleanup")
+
+    try:
+        claude.sdk.ClaudeSDKClient = RuntimeFailedClient
+        claude.sdk.query = shortcut_must_not_run
+        main.quota = _Quota()
+        config.BACKEND_CHEAP = "claude"
+        config.FALLBACK_ON_QUOTA = False
+
+        with captured_gateway_logs() as records:
+            response = TestClient(app, raise_server_exceptions=False).post(
+                "/generate",
+                headers={"X-API-Key": config.API_KEY},
+                json={"user": "prompt", "tier": "cheap"},
+            )
+
+        assert response.status_code == 502, response.text
+        assert response.json()["detail"] == "Command failed with exit code -9"
+        messages = [record.getMessage() for record in records]
+        assert len(messages) == 1, messages
+        assert "status=502" in messages[0]
+        assert "reason=sdk_query_error" in messages[0]
+    finally:
+        claude.sdk.ClaudeSDKClient = original_client
+        claude.sdk.query = original_query
+        main.quota = original_quota
+        config.BACKEND_CHEAP, config.FALLBACK_ON_QUOTA = original_config
 
 
 def test_generate_logs_duration_and_request_metadata() -> None:
