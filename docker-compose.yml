@@ -14,6 +14,16 @@ services:
       # normal file, not onto a single-file mount point (which fails EBUSY).
       LLM_GATEWAY_ENV_FILE: /config/.env
       LLM_GATEWAY_HOST: 0.0.0.0
+      # linuxkit's kernel (Docker Desktop on Mac) SIGILLs in OpenSSL's ARM
+      # capability probe when cryptography's _rust module loads at import time;
+      # setting an explicit armcap mask skips the probe entirely and fixes it.
+      # 0x3f = NEON|AES|SHA1|SHA256|PMULL, the features every Apple M-series core
+      # has, so we only forgo SHA512/SM3/SM4/SHA3 acceleration — no cost at our
+      # TLS volume. Do not widen this: claiming a feature the CPU lacks would move
+      # the crash from import time to first use. Colima on the hub doesn't need it
+      # (its kernel probes fine) but the mask is safe there, and one config for
+      # both machines beats per-machine drift.
+      OPENSSL_armcap: "0x3f"
     volumes:
       # Mount the DIRECTORY, never ./config/.env:/config/.env — a file mount
       # would break the rename-based persist in PUT /config.
