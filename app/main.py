@@ -90,18 +90,20 @@ class EmbedIn(BaseModel):
     dims: int = 3072
 
 
-def _tier_config(tier: Tier) -> tuple[str, str, str, str]:
-    """(backend, claude_model, openrouter_model, effort) for an intent tier."""
+def _tier_config(tier: Tier) -> tuple[str, str, str, str, str]:
+    """(backend, claude_model, openrouter_model, effort, thinking) for an intent tier."""
     if tier == "summary":
-        return config.BACKEND_SUMMARY, config.MODEL_SUMMARY, config.OR_MODEL_SUMMARY, config.EFFORT_SUMMARY
-    return config.BACKEND_CHEAP, config.MODEL_CHEAP, config.OR_MODEL_CHEAP, config.EFFORT_CHEAP
+        return (config.BACKEND_SUMMARY, config.MODEL_SUMMARY, config.OR_MODEL_SUMMARY,
+                config.EFFORT_SUMMARY, config.THINKING_SUMMARY)
+    return (config.BACKEND_CHEAP, config.MODEL_CHEAP, config.OR_MODEL_CHEAP,
+            config.EFFORT_CHEAP, config.THINKING_CHEAP)
 
 
 # ── routes ───────────────────────────────────────────────────────────────────
 @app.post("/generate", dependencies=[Depends(require_key)])
 async def generate(body: GenerateIn) -> dict[str, Any]:
     started = time.monotonic()
-    backend, cmodel, ormodel, effort = _tier_config(body.tier)
+    backend, cmodel, ormodel, effort, thinking = _tier_config(body.tier)
     actual_backend = backend
     actual_model = cmodel if backend == "claude" else ormodel
     status: int | str = 500
@@ -112,7 +114,7 @@ async def generate(body: GenerateIn) -> dict[str, Any]:
             try:
                 res = await claude.generate(
                     system=body.system, user=body.user, model=cmodel,
-                    effort=effort, schema=body.schema_,
+                    effort=effort, thinking=thinking, schema=body.schema_,
                 )
                 quota.record(res["meta"])
                 status = 200
@@ -176,7 +178,8 @@ async def describe(body: DescribeIn) -> dict[str, Any]:
             res = await claude.describe(
                 system=body.system, prompt=body.prompt, mime=body.mime,
                 data_b64=body.data_b64, model=config.MODEL_CHEAP,
-                effort=config.EFFORT_CHEAP, schema=body.schema_,
+                effort=config.EFFORT_CHEAP, thinking=config.THINKING_CHEAP,
+                schema=body.schema_,
             )
             quota.record(res["meta"])
             return {"backend": "claude", **res}
