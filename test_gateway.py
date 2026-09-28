@@ -179,10 +179,19 @@ def test_quota_honours_reset_timestamp() -> None:
 
 
 def test_tier_routing() -> None:
-    b, cm, om, _ = _tier_config("summary")
+    b, cm, om, _, th = _tier_config("summary")
     assert cm == config.MODEL_SUMMARY and om == config.OR_MODEL_SUMMARY
-    b, cm, om, _ = _tier_config("cheap")
+    assert th == config.THINKING_SUMMARY
+    b, cm, om, _, th = _tier_config("cheap")
     assert cm == config.MODEL_CHEAP and om == config.OR_MODEL_CHEAP
+    assert th == config.THINKING_CHEAP
+
+
+def test_options_pass_tier_thinking_to_the_sdk() -> None:
+    # Sonnet 5.5 400s on thinking.type=disabled, so the mode must reach the SDK
+    # as configured instead of being pinned to disabled.
+    assert claude._options("m", "medium", "adaptive", "", None).thinking == {"type": "adaptive"}
+    assert claude._options("m", "low", "disabled", "", None).thinking == {"type": "disabled"}
 
 
 def test_api_key_is_unset_at_import() -> None:
@@ -246,6 +255,7 @@ def test_config_put_rejects_unknown_and_invalid_values_without_changes() -> None
         ({"TYPO_BACKEND": "claude"}, "unknown config key"),
         ({"BACKEND_CHEAP": "gemini"}, "claude or openrouter"),
         ({"EFFORT_SUMMARY": "extreme"}, "must be one of"),
+        ({"THINKING_SUMMARY": "enabled"}, "disabled or adaptive"),
         ({"MAX_BUDGET_USD": 0}, "positive number"),
         ({"CLAUDE_TIMEOUT_S": 200}, "below agent-mem's 200s"),
     ]

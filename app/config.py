@@ -77,7 +77,7 @@ FALLBACK_ON_QUOTA = (os.getenv("LLM_GATEWAY_FALLBACK_ON_QUOTA", "true").strip().
 # ── Claude (subscription seat, via the bundled CLI) ──────────────────────────
 # Two tiers so callers pick intent, not a model string. Keeping the mapping
 # here means a model swap is a systemd restart, not an agent-mem deploy.
-MODEL_SUMMARY = os.getenv("LLM_GATEWAY_MODEL_SUMMARY", "claude-sonnet-5")
+MODEL_SUMMARY = os.getenv("LLM_GATEWAY_MODEL_SUMMARY", "claude-sonnet-5-5")
 MODEL_CHEAP = os.getenv("LLM_GATEWAY_MODEL_CHEAP", "claude-haiku-4-5")
 
 # OpenRouter equivalents, used when a route's backend is "openrouter" and as the
@@ -105,6 +105,13 @@ OR_MAX_TOKENS_DESCRIBE = _int("LLM_GATEWAY_OR_MAX_TOKENS_DESCRIBE", 2048)
 
 EFFORT_SUMMARY = os.getenv("LLM_GATEWAY_EFFORT_SUMMARY", "medium")
 EFFORT_CHEAP = os.getenv("LLM_GATEWAY_EFFORT_CHEAP", "low")
+
+# Thinking mode per tier. Sonnet 5.5 rejects thinking.type=disabled with a 400,
+# so the summary tier runs adaptive and lets EFFORT_SUMMARY bound it. Haiku 4.5
+# still accepts disabled, which keeps cheap-tier calls free of thinking tokens.
+# A model swap that changes what the API accepts must change this with it.
+THINKING_SUMMARY = os.getenv("LLM_GATEWAY_THINKING_SUMMARY", "adaptive")
+THINKING_CHEAP = os.getenv("LLM_GATEWAY_THINKING_CHEAP", "disabled")
 
 # Hard per-call ceiling handed to the SDK. Notional on a subscription (nothing
 # is billed), but it still aborts a runaway generation instead of letting one
@@ -157,6 +164,8 @@ EDITABLE_ENV_KEYS = {
     "OR_MAX_TOKENS_DESCRIBE": "LLM_GATEWAY_OR_MAX_TOKENS_DESCRIBE",
     "EFFORT_SUMMARY": "LLM_GATEWAY_EFFORT_SUMMARY",
     "EFFORT_CHEAP": "LLM_GATEWAY_EFFORT_CHEAP",
+    "THINKING_SUMMARY": "LLM_GATEWAY_THINKING_SUMMARY",
+    "THINKING_CHEAP": "LLM_GATEWAY_THINKING_CHEAP",
     "FALLBACK_ON_QUOTA": "LLM_GATEWAY_FALLBACK_ON_QUOTA",
     "MAX_BUDGET_USD": "LLM_GATEWAY_MAX_BUDGET_USD",
     "CLAUDE_TIMEOUT_S": "LLM_GATEWAY_CLAUDE_TIMEOUT_S",
@@ -164,6 +173,7 @@ EDITABLE_ENV_KEYS = {
 
 _BACKENDS = {"claude", "openrouter"}
 _EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+_THINKING = {"disabled", "adaptive"}
 _MODEL_KEYS = {"MODEL_SUMMARY", "MODEL_CHEAP", "OR_MODEL_SUMMARY", "OR_MODEL_CHEAP",
                "OR_MODEL_DESCRIBE"}
 _CONFIG_LOCK = threading.Lock()
@@ -219,6 +229,10 @@ def _validate_updates(updates: dict[str, Any]) -> dict[str, Any]:
                 raise ConfigValidationError(
                     f"{name} must be one of: {', '.join(sorted(_EFFORTS))}"
                 )
+            validated[name] = value.strip().lower()
+        elif name.startswith("THINKING_"):
+            if not isinstance(value, str) or value.strip().lower() not in _THINKING:
+                raise ConfigValidationError(f"{name} must be disabled or adaptive")
             validated[name] = value.strip().lower()
         elif name in _MODEL_KEYS:
             if not isinstance(value, str) or not value.strip() or any(ch.isspace() for ch in value):

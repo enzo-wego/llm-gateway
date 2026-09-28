@@ -7,8 +7,10 @@ text-in / JSON-out call. Every option here exists to remove something:
   setting_sources=[]            do NOT load ~/.claude/CLAUDE.md or project
                                 settings — otherwise the operator's personal
                                 instructions ride along on every request
-  thinking disabled             these are extraction tasks, not reasoning ones,
-                                and thinking tokens come out of the seat's quota
+  thinking per tier             disabled where the model allows it: these are
+                                extraction tasks, and thinking tokens come out of
+                                the seat's quota. Models that reject disabled
+                                (Sonnet 5.5) run adaptive, bounded by effort
   output_format json_schema     the model must return a parsed object; no
                                 brace-scraping the way internal/anthropic does
 
@@ -71,7 +73,9 @@ def _unwrap_fenced_block(text: str) -> str:
     return "\n".join(lines[1:-1]).strip()
 
 
-def _options(model: str, effort: str, system: str, schema: dict[str, Any] | None) -> sdk.ClaudeAgentOptions:
+def _options(
+    model: str, effort: str, thinking: str, system: str, schema: dict[str, Any] | None
+) -> sdk.ClaudeAgentOptions:
     return sdk.ClaudeAgentOptions(
         model=model,
         system_prompt=system or None,
@@ -80,7 +84,7 @@ def _options(model: str, effort: str, system: str, schema: dict[str, Any] | None
         setting_sources=[],
         max_turns=_MAX_TURNS,
         effort=effort,
-        thinking={"type": "disabled"},
+        thinking={"type": thinking},
         max_budget_usd=config.MAX_BUDGET_USD,
         output_format=({"type": "json_schema", "schema": schema} if schema else None),
     )
@@ -229,15 +233,16 @@ async def _guarded(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, An
 
 
 async def generate(
-    *, system: str, user: str, model: str, effort: str, schema: dict[str, Any] | None
+    *, system: str, user: str, model: str, effort: str, thinking: str,
+    schema: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Single-shot text generation."""
-    return await _guarded(user, _options(model, effort, system, schema))
+    return await _guarded(user, _options(model, effort, thinking, system, schema))
 
 
 async def describe(
     *, system: str, prompt: str, mime: str, data_b64: str, model: str, effort: str,
-    schema: dict[str, Any] | None,
+    thinking: str, schema: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Multimodal description. The image rides the streaming-input path, which
     is the only way to attach content blocks rather than a bare string."""
@@ -254,4 +259,4 @@ async def describe(
             },
         }
 
-    return await _guarded(_prompt(), _options(model, effort, system, schema))
+    return await _guarded(_prompt(), _options(model, effort, thinking, system, schema))
