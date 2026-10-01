@@ -77,8 +77,11 @@ FALLBACK_ON_QUOTA = (os.getenv("LLM_GATEWAY_FALLBACK_ON_QUOTA", "true").strip().
 # ── Claude (subscription seat, via the bundled CLI) ──────────────────────────
 # Two tiers so callers pick intent, not a model string. Keeping the mapping
 # here means a model swap is a systemd restart, not an agent-mem deploy.
-MODEL_SUMMARY = os.getenv("LLM_GATEWAY_MODEL_SUMMARY", "claude-sonnet-5-5")
-MODEL_CHEAP = os.getenv("LLM_GATEWAY_MODEL_CHEAP", "claude-haiku-4-5")
+# Defaults are CLI aliases that resolve to the newest model in each family, so
+# a new Sonnet or Haiku lands without a config change. Pin a full id (e.g.
+# claude-sonnet-5-5) when a release must not move under you.
+MODEL_SUMMARY = os.getenv("LLM_GATEWAY_MODEL_SUMMARY", "sonnet")
+MODEL_CHEAP = os.getenv("LLM_GATEWAY_MODEL_CHEAP", "haiku")
 
 # OpenRouter equivalents, used when a route's backend is "openrouter" and as the
 # quota-fallback target. Defaults reproduce what agent-mem runs today.
