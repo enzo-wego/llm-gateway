@@ -99,6 +99,12 @@ def _tier_config(tier: Tier) -> tuple[str, str, str, str, str]:
             config.EFFORT_CHEAP, config.THINKING_CHEAP)
 
 
+def _active_model(tier: Tier) -> str:
+    """The model a tier actually calls: the Claude id or the OpenRouter id, per its backend."""
+    backend, claude_model, or_model, _, _ = _tier_config(tier)
+    return claude_model if backend == "claude" else or_model
+
+
 # ── routes ───────────────────────────────────────────────────────────────────
 @app.post("/generate", dependencies=[Depends(require_key)])
 async def generate(body: GenerateIn) -> dict[str, Any]:
@@ -283,8 +289,8 @@ async def health() -> dict[str, Any]:
             "embed": "openrouter",
         },
         "models": {
-            "summary": config.MODEL_SUMMARY,
-            "cheap": config.MODEL_CHEAP,
+            "summary": _active_model("summary"),
+            "cheap": _active_model("cheap"),
             "describe": config.MODEL_CHEAP if config.BACKEND_DESCRIBE == "claude" else config.OR_MODEL_DESCRIBE,
             "embed": config.EMBED_MODEL,
         },
@@ -306,10 +312,12 @@ async def health() -> dict[str, Any]:
 @app.on_event("startup")
 async def _startup() -> None:
     log.info(
-        "llm-gateway up · summary=%s/%s cheap=%s/%s describe=%s embed=%s · fallback=%s alerts=%s",
-        config.BACKEND_SUMMARY, config.MODEL_SUMMARY,
-        config.BACKEND_CHEAP, config.MODEL_CHEAP,
-        config.BACKEND_DESCRIBE, config.EMBED_MODEL,
+        "llm-gateway up · summary=%s/%s cheap=%s/%s describe=%s/%s embed=%s · fallback=%s alerts=%s",
+        config.BACKEND_SUMMARY, _active_model("summary"),
+        config.BACKEND_CHEAP, _active_model("cheap"),
+        config.BACKEND_DESCRIBE,
+        config.MODEL_CHEAP if config.BACKEND_DESCRIBE == "claude" else config.OR_MODEL_DESCRIBE,
+        config.EMBED_MODEL,
         config.FALLBACK_ON_QUOTA, config.ALERTS_ENABLED,
     )
     if not config.ALERTS_ENABLED:

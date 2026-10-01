@@ -64,7 +64,13 @@ daily from cron:
 ```
 
 Pin a full id (e.g. `LLM_GATEWAY_MODEL_SUMMARY=claude-sonnet-5-5`) when a model
-must not move. A new model that rejects the configured `THINKING_*` mode fails
+must not move. A full id needs a CLI that knows it: CLI 2.1.283 rejects
+`claude-sonnet-5-5` with `[claude-code:unrecognized_model]`.
+
+The refresh only moves the Claude backend. A tier on `openrouter` calls
+`OR_MODEL_*`, and OpenRouter's floating aliases (`~anthropic/claude-sonnet-latest`,
+`~anthropic/claude-haiku-latest`, `~anthropic/claude-opus-latest`) resolve
+server side with no rebuild. A new model that rejects the configured `THINKING_*` mode fails
 with a 400 until the pin or the mode changes.
 
 `GET /config` and `PUT /config` require `X-API-Key`. The config response never

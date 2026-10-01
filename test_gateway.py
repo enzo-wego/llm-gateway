@@ -187,6 +187,18 @@ def test_tier_routing() -> None:
     assert th == config.THINKING_CHEAP
 
 
+def test_health_reports_the_model_the_backend_calls() -> None:
+    # An openrouter tier reporting its Claude id hid a real model swap in prod.
+    old = config.BACKEND_SUMMARY, config.BACKEND_CHEAP
+    try:
+        config.BACKEND_SUMMARY, config.BACKEND_CHEAP = "openrouter", "claude"
+        models = TestClient(app).get("/health").json()["models"]
+        assert models["summary"] == config.OR_MODEL_SUMMARY
+        assert models["cheap"] == config.MODEL_CHEAP
+    finally:
+        config.BACKEND_SUMMARY, config.BACKEND_CHEAP = old
+
+
 def test_options_pass_tier_thinking_to_the_sdk() -> None:
     # Sonnet 5.5 400s on thinking.type=disabled, so the mode must reach the SDK
     # as configured instead of being pinned to disabled.
