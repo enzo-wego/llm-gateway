@@ -52,6 +52,21 @@ response saying so.
 Callers pick a **tier**, never a model name — that keeps model choice here (a
 restart) rather than in a consumer's deploy.
 
+Tier models default to the CLI aliases `sonnet` and `haiku`, which resolve to
+the newest model in each family. The CLI that resolves them ships inside
+`claude-agent-sdk`, so a new model is only reachable once the image carries a
+newer SDK. `deploy/refresh-sdk.sh` rebuilds when PyPI has one, checks a real
+`/generate` call, and restores the previous image if anything fails. Run it
+daily from cron:
+
+```
+15 12 * * * PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin /path/to/llm-gateway/deploy/refresh-sdk.sh >>~/.cache/llm-gateway-refresh.log 2>&1
+```
+
+Pin a full id (e.g. `LLM_GATEWAY_MODEL_SUMMARY=claude-sonnet-5-5`) when a model
+must not move. A new model that rejects the configured `THINKING_*` mode fails
+with a 400 until the pin or the mode changes.
+
 `GET /config` and `PUT /config` require `X-API-Key`. The config response never
 contains service or provider credentials. Updates reject unknown keys and
 invalid values, rewrite only the supplied `.env` keys via an atomic rename, and
