@@ -244,8 +244,10 @@ async def describe(
     *, system: str, prompt: str, mime: str, data_b64: str, model: str, effort: str,
     thinking: str, schema: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Multimodal description. The image rides the streaming-input path, which
-    is the only way to attach content blocks rather than a bare string."""
+    """Multimodal description. The attachment rides the streaming-input path,
+    which is the only way to attach content blocks rather than a bare string.
+    PDFs go as a document block so the model reads the text layer, not pixels."""
+    kind = "document" if mime == "application/pdf" else "image"
 
     async def _prompt():
         yield {
@@ -254,7 +256,7 @@ async def describe(
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image", "source": {"type": "base64", "media_type": mime, "data": data_b64}},
+                    {"type": kind, "source": {"type": "base64", "media_type": mime, "data": data_b64}},
                 ],
             },
         }

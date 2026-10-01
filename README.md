@@ -43,6 +43,10 @@ All routes except `/health` require `X-API-Key`.
 | `PUT /config` | — | partial configuration update, applied live and persisted to `.env` |
 | `GET /health` | — | quota state, counters, active backends |
 
+`/describe` takes an image (`image/png`, `image/jpeg`, `image/gif`,
+`image/webp`) or a PDF (`application/pdf`). A PDF goes to the model as a
+document, so it reads the text layer rather than a rasterized page.
+
 Pass a JSON Schema as `schema` and the response contains a parsed `output`
 object. Omit it and you get raw `text` back. This holds on **both** backends —
 before, the OpenRouter path accepted `schema` and ignored it, so a backend
