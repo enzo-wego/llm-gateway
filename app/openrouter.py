@@ -112,14 +112,21 @@ async def generate(
 async def describe(
     *, prompt: str, mime: str, data_b64: str, model: str, schema: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    """Multimodal description via an image data URI, as agent-mem does today."""
+    """Multimodal description via a data URI. Images go as image_url, as
+    agent-mem does today; PDFs need OpenRouter's file part instead."""
+    uri = f"data:{mime};base64,{data_b64}"
+    attachment = (
+        {"type": "file", "file": {"filename": "attachment.pdf", "file_data": uri}}
+        if mime == "application/pdf"
+        else {"type": "image_url", "image_url": {"url": uri}}
+    )
     data = await _post(
         "/chat/completions",
         {
             "model": model,
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data_b64}"}},
+                attachment,
             ]}],
             "temperature": 0.2,
             "max_tokens": config.OR_MAX_TOKENS_DESCRIBE,

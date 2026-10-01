@@ -343,6 +343,39 @@ def test_describe_model_defaults_to_the_summary_tier() -> None:
     )
 
 
+def test_describe_sends_pdfs_as_documents_and_images_as_images() -> None:
+    """A PDF in an image slot is a 400 on OpenRouter and unreadable junk on the
+    seat, with a 200. Each backend needs its own PDF content type."""
+    sent: list = []
+    original_post, original_guarded = openrouter._post, claude._guarded
+
+    async def fake_post(path, payload, timeout):
+        sent.append(payload["messages"][0]["content"][1])
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    async def fake_guarded(prompt, options):
+        async for msg in prompt:
+            sent.append(msg["message"]["content"][1])
+        return {"text": "ok", "meta": {}}
+
+    openrouter._post, claude._guarded = fake_post, fake_guarded
+    try:
+        for mime in ("application/pdf", "image/png"):
+            asyncio.run(openrouter.describe(prompt="p", mime=mime, data_b64="QQ==", model="m"))
+            asyncio.run(claude.describe(system="", prompt="p", mime=mime, data_b64="QQ==",
+                                        model="m", effort="low", thinking="disabled", schema=None))
+    finally:
+        openrouter._post, claude._guarded = original_post, original_guarded
+
+    or_pdf, claude_pdf, or_png, claude_png = sent
+    assert or_pdf == {"type": "file", "file": {"filename": "attachment.pdf",
+                                               "file_data": "data:application/pdf;base64,QQ=="}}
+    assert claude_pdf["type"] == "document"
+    assert claude_pdf["source"]["media_type"] == "application/pdf"
+    assert or_png == {"type": "image_url", "image_url": {"url": "data:image/png;base64,QQ=="}}
+    assert claude_png["type"] == "image"
+
+
 def test_openrouter_describe_max_tokens_is_configurable() -> None:
     """describe had a hard-coded 2048 cap that truncated dense pages. It must now
     follow config, and default to the historical 2048 so agent-mem is unaffected."""
