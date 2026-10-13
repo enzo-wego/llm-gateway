@@ -23,10 +23,11 @@ notify() {
   local token channel
   token=$(env_get SLACK_BOT_TOKEN); channel=$(env_get SLACK_ALERT_CHANNEL)
   [[ -n $token && -n $channel ]] || return 0
+  # Header from a builtin printf, so the token never shows in `ps` as a curl arg.
   python3 -c 'import json,sys; print(json.dumps({"channel": sys.argv[1], "text": sys.argv[2], "unfurl_links": False}))' \
     "$channel" "*llm-gateway* $1" \
     | curl -fsS -m 10 https://slack.com/api/chat.postMessage \
-        -H "Authorization: Bearer $token" -H 'content-type: application/json; charset=utf-8' -d @- \
+        -H @<(printf 'Authorization: Bearer %s\n' "$token") -H 'content-type: application/json; charset=utf-8' -d @- \
     | grep -q '"ok":true' || log "slack notify failed"
 }
 
