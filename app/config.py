@@ -110,7 +110,7 @@ EFFORT_SUMMARY = os.getenv("LLM_GATEWAY_EFFORT_SUMMARY", "medium")
 EFFORT_CHEAP = os.getenv("LLM_GATEWAY_EFFORT_CHEAP", "low")
 
 # Thinking mode per tier. Sonnet 5.5 rejects thinking.type=disabled with a 400,
-# so the summary tier runs adaptive and lets EFFORT_SUMMARY bound it. Haiku 4.5
+# so the summary tier runs adaptive and lets EFFORT_SUMMARY bound it. Haiku 5.5
 # still accepts disabled, which keeps cheap-tier calls free of thinking tokens.
 # A model swap that changes what the API accepts must change this with it.
 THINKING_SUMMARY = os.getenv("LLM_GATEWAY_THINKING_SUMMARY", "adaptive")

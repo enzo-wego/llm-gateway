@@ -60,8 +60,9 @@ Tier models default to the CLI aliases `sonnet` and `haiku`, which resolve to
 the newest model in each family. The CLI that resolves them ships inside
 `claude-agent-sdk`, so a new model is only reachable once the image carries a
 newer SDK. `deploy/refresh-sdk.sh` rebuilds when PyPI has one, checks a real
-`/generate` call, and restores the previous image if anything fails. Run it
-daily from cron:
+call on both `/generate` tiers and `/describe`, and restores the previous image
+if anything fails. It posts the outcome to `SLACK_ALERT_CHANNEL` (a user id
+gets a DM) when `config/.env` sets it. Run it daily from cron:
 
 ```
 15 12 * * * PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin /path/to/llm-gateway/deploy/refresh-sdk.sh >>~/.cache/llm-gateway-refresh.log 2>&1
