@@ -108,12 +108,14 @@ to Slack (deduped per window):
 | Signal | Meaning |
 |---|---|
 | `RateLimitInfo.status == "rejected"` | Seat quota spent |
-| `status == "allowed_warning"` | Approaching the cap |
+| `status == "allowed_warning"` and utilization ≥ `LLM_GATEWAY_QUOTA_WARN_PCT` (95) | Approaching the cap |
 | `AssistantMessage.error == "authentication_failed"` | CLI login expired |
 | OpenRouter `402` | Embedding budget gone — the graph has stopped growing |
 
 Seat quotas are per-window and per-family: `five_hour`, `seven_day`,
 `seven_day_opus`, `seven_day_sonnet`, `overage`. The alert names which tripped.
+
+Quota alerts with a usable reset time post once per window: after Slack accepts the post, that alert stays muted until the reset (persisted to `LLM_GATEWAY_ALERT_STATE_FILE`, so it survives restarts); other alerts dedupe for `LLM_GATEWAY_ALERT_DEDUPE_S`. A failed post retries after that interval. After a deploy, prove the mute survives a container recreate with `deploy/alert_selftest.py` (usage in its docstring; it uses a separate self-test state file and posts nothing).
 
 ## ⚠️ The `ANTHROPIC_API_KEY` trap
 
