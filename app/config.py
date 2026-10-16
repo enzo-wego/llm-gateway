@@ -148,6 +148,10 @@ SLACK_ALERT_CHANNEL = os.getenv("SLACK_ALERT_CHANNEL", "").strip()
 # firing once. Prevents a sustained outage from posting on every request.
 ALERT_DEDUPE_S = _int("LLM_GATEWAY_ALERT_DEDUPE_S", 1800)
 
+# An allowed_warning only reaches Slack once utilization is at least this
+# percent. The API flags allowed_warning well before the cap (seen at 83%).
+QUOTA_WARN_PCT = _int("LLM_GATEWAY_QUOTA_WARN_PCT", 95)
+
 # Where alert suppression is persisted so a mute survives restart/rebuild.
 # $HOME is the claude-home volume in the container.
 ALERT_STATE_FILE = os.getenv(

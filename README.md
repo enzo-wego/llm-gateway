@@ -108,7 +108,7 @@ to Slack (deduped per window):
 | Signal | Meaning |
 |---|---|
 | `RateLimitInfo.status == "rejected"` | Seat quota spent |
-| `status == "allowed_warning"` | Approaching the cap |
+| `status == "allowed_warning"` and utilization ≥ `LLM_GATEWAY_QUOTA_WARN_PCT` (95) | Approaching the cap |
 | `AssistantMessage.error == "authentication_failed"` | CLI login expired |
 | OpenRouter `402` | Embedding budget gone — the graph has stopped growing |
 

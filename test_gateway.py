@@ -1098,8 +1098,8 @@ def isolated_alerts(posts: list):
             alerts._reset_state()
 
 
-def _info(status="allowed_warning", resets=10000, kind="seven_day"):
-    return SimpleNamespace(status=status, rate_limit_type=kind, resets_at=resets, utilization=0.9)
+def _info(status="allowed_warning", resets=10000, kind="seven_day", util=0.95):
+    return SimpleNamespace(status=status, rate_limit_type=kind, resets_at=resets, utilization=util)
 
 
 def _fire(ctl, at, info=None):
@@ -1153,6 +1153,20 @@ def test_alert_warning_does_not_mute_rejection() -> None:
         assert len(posts) == 2
         _fire(ctl, 2801, _info("rejected"))
         assert len(posts) == 2
+
+
+def test_alert_warn_threshold() -> None:
+    for util, expected in ((0.94, 0), (0.95, 1), (None, 0), (1.0, 1)):
+        posts: list = []
+        with isolated_alerts(posts) as ctl:
+            _fire(ctl, 1000, _info(util=util))
+            assert len(posts) == expected, (util, posts)
+    posts = []
+    with isolated_alerts(posts) as ctl:
+        _fire(ctl, 1000, _info("rejected", util=0.5))
+        assert len(posts) == 1, posts
+        _fire(ctl, 1000, _info("rejected", util=None))
+        assert len(posts) == 1, posts
 
 
 def test_alert_unusable_resets_fall_back_to_dedupe() -> None:

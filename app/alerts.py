@@ -193,7 +193,7 @@ async def on_rate_limit(info) -> None:
             critical=True,
             until=usable,
         )
-    else:
+    elif isinstance(util, (int, float)) and util * 100 >= config.QUOTA_WARN_PCT:
         await alert(
             f"quota-warn:{kind}:{resets}",
             f"*Claude seat quota running low* (`{kind}`). {pct}"
