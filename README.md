@@ -115,6 +115,8 @@ to Slack (deduped per window):
 Seat quotas are per-window and per-family: `five_hour`, `seven_day`,
 `seven_day_opus`, `seven_day_sonnet`, `overage`. The alert names which tripped.
 
+Quota alerts with a usable reset time post once per window: after Slack accepts the post, that alert stays muted until the reset (persisted to `LLM_GATEWAY_ALERT_STATE_FILE`, so it survives restarts); other alerts dedupe for `LLM_GATEWAY_ALERT_DEDUPE_S`. A failed post retries after that interval. After a deploy, prove the mute survives a container recreate with `deploy/alert_selftest.py` (usage in its docstring; it uses a separate self-test state file and posts nothing).
+
 ## ⚠️ The `ANTHROPIC_API_KEY` trap
 
 If that variable is present in the environment, the Claude CLI **silently bills

@@ -16,6 +16,7 @@ backend 502s. These two do not:
 """
 
 import asyncio
+import json
 import logging
 from contextlib import contextmanager
 import os
@@ -23,13 +24,25 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+from types import SimpleNamespace
 
 os.environ.setdefault("LLM_GATEWAY_API_KEY", "test")
 os.environ.setdefault("OPENROUTER_API_KEY", "sk-or-test")
 
-from app import claude, config, main, openrouter  # noqa: E402
+import httpx  # noqa: E402
+from app import alerts, claude, config, main, openrouter  # noqa: E402
 from app.main import _Quota, _tier_config, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+
+
+def _isolate_alert_globals() -> None:
+    """Keep the whole suite off the live state file and off Slack."""
+    config.ALERT_STATE_FILE = os.path.join(tempfile.mkdtemp(), "alert-state.json")
+    config.ALERTS_ENABLED = False
+    config.SLACK_BOT_TOKEN = ""
+
+
+_isolate_alert_globals()
 
 
 @contextmanager
@@ -1018,10 +1031,276 @@ def test_generate_logs_each_outcome_once() -> None:
         ) = original_config
 
 
+# ── alert mute-until-reset ───────────────────────────────────────────────────
+
+
+class _AlertCtl:
+    def __init__(self, posts: list, state_path: str) -> None:
+        self.posts = posts
+        self.state_path = state_path
+        self.now = 1000.0
+        self.resp = {"ok": True}
+        self.yield_in_post = False
+
+
+@contextmanager
+def isolated_alerts(posts: list):
+    """Fresh alert state, fake clock and fake Slack transport; restore after."""
+    ctl = _AlertCtl(posts, "")
+    saved = (
+        config.ALERT_STATE_FILE, config.ALERTS_ENABLED, config.SLACK_BOT_TOKEN,
+        config.SLACK_ALERT_CHANNEL, config.ALERT_DEDUPE_S,
+        alerts.time.time, alerts.httpx.AsyncClient,
+    )
+
+    class Resp:
+        def json(self):
+            if isinstance(ctl.resp, Exception):
+                raise ctl.resp
+            return ctl.resp
+
+    class Client:
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            if ctl.yield_in_post:
+                await asyncio.sleep(0)
+            if isinstance(ctl.resp, httpx.ConnectError):
+                raise ctl.resp
+            posts.append(k.get("json"))
+            return Resp()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctl.state_path = os.path.join(tmp, "state", "alert-state.json")
+        config.ALERT_STATE_FILE = ctl.state_path
+        config.ALERTS_ENABLED = True
+        config.SLACK_BOT_TOKEN = "x"
+        config.SLACK_ALERT_CHANNEL = "x"
+        config.ALERT_DEDUPE_S = 1800
+        alerts._reset_state()
+        alerts.time.time = lambda: ctl.now
+        alerts.httpx.AsyncClient = Client
+        try:
+            yield ctl
+        finally:
+            (
+                config.ALERT_STATE_FILE, config.ALERTS_ENABLED, config.SLACK_BOT_TOKEN,
+                config.SLACK_ALERT_CHANNEL, config.ALERT_DEDUPE_S,
+                alerts.time.time, alerts.httpx.AsyncClient,
+            ) = saved
+            alerts._reset_state()
+
+
+def _info(status="allowed_warning", resets=10000, kind="seven_day"):
+    return SimpleNamespace(status=status, rate_limit_type=kind, resets_at=resets, utilization=0.9)
+
+
+def _fire(ctl, at, info=None):
+    ctl.now = float(at)
+    asyncio.run(alerts.on_rate_limit(info or _info()))
+
+
+def _persisted(ctl) -> dict:
+    with open(ctl.state_path) as f:
+        return json.load(f)
+
+
+def test_alert_warning_muted_until_reset() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        _fire(ctl, 1000)
+        _fire(ctl, 2801)
+        assert len(posts) == 1, posts
+        assert posts[0]["text"].endswith("Muted until the reset."), posts[0]["text"]
+
+
+def test_alert_mute_expires_at_reset() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        _fire(ctl, 1000)
+        _fire(ctl, 9999)
+        assert len(posts) == 1
+        _fire(ctl, 10000)
+        assert len(posts) == 2
+    posts = []
+    with isolated_alerts(posts) as ctl:
+        for at, expected in ((1000, 1), (4999, 1), (5000, 2)):
+            ctl.now = float(at)
+            asyncio.run(alerts.alert("k", "t", until=5000))
+            assert len(posts) == expected, (at, len(posts))
+
+
+def test_alert_new_window_posts_again() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        _fire(ctl, 1000)
+        _fire(ctl, 2801, _info(resets=20000))
+        assert len(posts) == 2
+
+
+def test_alert_warning_does_not_mute_rejection() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        _fire(ctl, 1000)
+        _fire(ctl, 1000, _info("rejected"))
+        assert len(posts) == 2
+        _fire(ctl, 2801, _info("rejected"))
+        assert len(posts) == 2
+
+
+def test_alert_unusable_resets_fall_back_to_dedupe() -> None:
+    for bad in (None, "bad", float("nan"), float("inf"), True, 500, 1000):
+        for status in ("allowed_warning", "rejected"):
+            posts: list = []
+            with isolated_alerts(posts) as ctl:
+                _fire(ctl, 1000, _info(status, bad))
+                text = posts[0]["text"]
+                assert "unknown" in text, (bad, status, text)
+                assert "Muted until" not in text, (bad, status, text)
+                _fire(ctl, 2801, _info(status, bad))
+                assert len(posts) == 2, (bad, status)
+
+
+def _delivery_failure_case(first_resp) -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        key = "quota-warn:seven_day:10000"
+        ctl.resp = first_resp
+        _fire(ctl, 1000)
+        assert len(posts) == (0 if isinstance(first_resp, Exception) else 1)
+        attempts = len(posts)
+        assert _persisted(ctl)[key] == 2800
+        _fire(ctl, 1001)
+        assert len(posts) == attempts
+        ctl.resp = {"ok": True}
+        _fire(ctl, 2801)
+        assert len(posts) == attempts + 1
+        assert _persisted(ctl)[key] == 10000
+        alerts._reset_state()
+        _fire(ctl, 2802)
+        _fire(ctl, 9999)
+        assert len(posts) == attempts + 1
+
+
+def test_alert_delivery_failure_keeps_retrying() -> None:
+    _delivery_failure_case({"ok": False, "error": "x"})
+    _delivery_failure_case(httpx.ConnectError("boom"))
+
+
+def test_alert_concurrent_same_key_posts_once() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        ctl.yield_in_post = True
+
+        async def both():
+            await asyncio.gather(alerts.on_rate_limit(_info()), alerts.on_rate_limit(_info()))
+
+        asyncio.run(both())
+        assert len(posts) == 1, posts
+
+
+def test_alert_restart_keeps_mute() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        _fire(ctl, 1000)
+        alerts._reset_state()
+        _fire(ctl, 2801)
+        assert len(posts) == 1
+    posts = []
+    with isolated_alerts(posts) as ctl:
+        os.makedirs(os.path.dirname(ctl.state_path))
+        with open(ctl.state_path, "w") as f:
+            json.dump({"quota-warn:seven_day:10000": 1500}, f)
+        _fire(ctl, 2000)
+        assert len(posts) == 1
+
+
+def test_alert_bad_state_files_never_raise() -> None:
+    cases = ["{", "[]", "null", '{"k": "later"}', '{"k": true}', '{"good": 9000, "bad": "x"}', "DIR"]
+    for content in cases:
+        posts: list = []
+        with isolated_alerts(posts) as ctl:
+            os.makedirs(os.path.dirname(ctl.state_path))
+            if content == "DIR":
+                os.makedirs(ctl.state_path)
+            else:
+                with open(ctl.state_path, "w") as f:
+                    f.write(content)
+            with captured_alert_logs() as records:
+                ctl.now = 1000.0
+                asyncio.run(alerts.alert("good", "t"))
+                asyncio.run(alerts.alert("bad", "t"))
+                asyncio.run(alerts.alert("other", "t"))
+            loads = [r for r in records if "state load failed" in r.getMessage()]
+            assert len(loads) <= 1, (content, len(loads))
+            texts = len(posts)
+            if content == '{"good": 9000, "bad": "x"}':
+                assert texts == 2, (content, texts)  # good stays muted
+            else:
+                assert texts == 3, (content, texts)
+
+
+@contextmanager
+def captured_alert_logs():
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = Capture()
+    alerts.log.addHandler(handler)
+    try:
+        yield records
+    finally:
+        alerts.log.removeHandler(handler)
+
+
+def test_alert_write_failure_keeps_old_file() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        os.makedirs(os.path.dirname(ctl.state_path))
+        seeded = json.dumps({"other-key": 99999})
+        with open(ctl.state_path, "w") as f:
+            f.write(seeded)
+        original_replace = alerts.os.replace
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+
+        alerts.os.replace = boom
+        try:
+            _fire(ctl, 1000)
+        finally:
+            alerts.os.replace = original_replace
+        assert len(posts) == 1
+        with open(ctl.state_path) as f:
+            assert f.read() == seeded
+        assert os.listdir(os.path.dirname(ctl.state_path)) == ["alert-state.json"]
+
+
+def test_alert_non_quota_alerts_unchanged() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        ctl.now = 1000.0
+        asyncio.run(alerts.on_openrouter_error(429, ""))
+        ctl.now = 2801.0
+        asyncio.run(alerts.on_openrouter_error(429, ""))
+        assert len(posts) == 2
+
+
 if __name__ == "__main__":
     os.environ["ANTHROPIC_API_KEY"] = "sk-ant-should-be-stripped"
     import importlib
     importlib.reload(config)  # prove the pop happens on import, not by luck
+    _isolate_alert_globals()
 
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

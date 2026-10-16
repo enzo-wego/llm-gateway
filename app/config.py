@@ -148,6 +148,13 @@ SLACK_ALERT_CHANNEL = os.getenv("SLACK_ALERT_CHANNEL", "").strip()
 # firing once. Prevents a sustained outage from posting on every request.
 ALERT_DEDUPE_S = _int("LLM_GATEWAY_ALERT_DEDUPE_S", 1800)
 
+# Where alert suppression is persisted so a mute survives restart/rebuild.
+# $HOME is the claude-home volume in the container.
+ALERT_STATE_FILE = os.getenv(
+    "LLM_GATEWAY_ALERT_STATE_FILE",
+    os.path.join(os.path.expanduser("~"), ".llm-gateway", "alert-state.json"),
+)
+
 ALERTS_ENABLED = bool(SLACK_BOT_TOKEN and SLACK_ALERT_CHANNEL)
 
 

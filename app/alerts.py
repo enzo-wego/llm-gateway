@@ -6,12 +6,17 @@ OpenRouter embedding budget runs dry. Each returns an error to agent-mem,
 which logs it and moves on — so without an outbound alert the first symptom
 is a graph that quietly stopped growing.
 
-Alerts are deduped per (kind, window) so a sustained outage posts once, not
-once per request.
+Quota alerts that carry a usable reset are muted until that reset once Slack
+accepts the post; everything else dedupes for ALERT_DEDUPE_S. Suppression
+persists to ALERT_STATE_FILE so it survives a restart.
 """
 
 import asyncio
+import json
 import logging
+import math
+import os
+import tempfile
 import time
 
 import httpx
@@ -21,62 +26,143 @@ from . import config
 log = logging.getLogger("llm-gateway.alerts")
 
 _SLACK_POST = "https://slack.com/api/chat.postMessage"
+_MAX_RESET_AHEAD_S = 31 * 86400
 
 # key -> unix ts when the suppression expires
 _suppressed: dict[str, float] = {}
+_loaded = False
 _lock = asyncio.Lock()
 
 
-async def alert(key: str, text: str, *, critical: bool = True) -> None:
+def _valid_expiry(v, now: float) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > now
+
+
+def _load(now: float) -> None:
+    """Load persisted suppressions. Caller holds _lock."""
+    global _loaded
+    _loaded = True
+    path = config.ALERT_STATE_FILE
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:  # JSONDecodeError is a ValueError
+        log.warning("Alert state load failed (%s); starting empty: %s", path, e)
+        return
+    if not isinstance(data, dict):
+        log.warning("Alert state load failed (%s); top level is not an object", path)
+        return
+    for k, v in data.items():
+        if isinstance(k, str) and _valid_expiry(v, now):
+            _suppressed[k] = float(v)
+
+
+def _save() -> None:
+    """Persist _suppressed atomically. Never raises. Caller holds _lock."""
+    path = config.ALERT_STATE_FILE
+    tmp_name = None
+    try:
+        d = os.path.dirname(path) or "."
+        os.makedirs(d, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=d, delete=False, encoding="utf-8") as tmp:
+            tmp_name = tmp.name
+            json.dump(_suppressed, tmp)
+        os.replace(tmp_name, path)
+    except Exception as e:  # noqa: BLE001 — alerting must never break a request
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        log.error("Alert state save failed (%s): %s", path, e)
+
+
+def _reset_state() -> None:
+    """Test helper: forget in-memory state so the next alert() reloads the file."""
+    _suppressed.clear()
+    global _loaded
+    _loaded = False
+
+
+async def alert(key: str, text: str, *, critical: bool = True, until: float | None = None) -> None:
     """Post text to Slack unless an identical key fired recently.
 
     key identifies the *condition*, not the occurrence — e.g.
     "quota:seven_day_sonnet:1785480000". Reusing the reset timestamp means a
     new window produces a new key and therefore a fresh alert, while the same
     window stays quiet.
+
+    If until (unix ts) is given and Slack accepts the post, the key stays
+    muted until then; otherwise it is muted for ALERT_DEDUPE_S.
     """
     now = time.time()
     async with _lock:
-        until = _suppressed.get(key, 0.0)
-        if now < until:
+        if not _loaded:
+            _load(now)
+        if now < _suppressed.get(key, 0.0):
             return
         _suppressed[key] = now + config.ALERT_DEDUPE_S
         # Opportunistic sweep; the dict is tiny and this avoids a background task.
         for k, exp in list(_suppressed.items()):
             if exp < now:
                 del _suppressed[k]
+        _save()
 
     level = log.error if critical else log.warning
     level("ALERT [%s] %s", key, text)
 
+    delivered = False
     if not config.ALERTS_ENABLED:
-        return
+        delivered = True
+    else:
+        icon = "🚨" if critical else "⚠️"
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.post(
+                    _SLACK_POST,
+                    headers={"Authorization": f"Bearer {config.SLACK_BOT_TOKEN}"},
+                    json={
+                        "channel": config.SLACK_ALERT_CHANNEL,
+                        "text": f"{icon} *llm-gateway* — {text}",
+                        # Standing rule: never let links expand into preview cards.
+                        "unfurl_links": False,
+                        "unfurl_media": False,
+                    },
+                )
+            body = r.json()
+            if body.get("ok"):
+                delivered = True
+            else:
+                log.error("Slack rejected alert: %s", body.get("error"))
+        except Exception as e:  # noqa: BLE001 — alerting must never break a request
+            log.error("Slack alert failed: %s", e)
 
-    icon = "🚨" if critical else "⚠️"
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(
-                _SLACK_POST,
-                headers={"Authorization": f"Bearer {config.SLACK_BOT_TOKEN}"},
-                json={
-                    "channel": config.SLACK_ALERT_CHANNEL,
-                    "text": f"{icon} *llm-gateway* — {text}",
-                    # Standing rule: never let links expand into preview cards.
-                    "unfurl_links": False,
-                    "unfurl_media": False,
-                },
-            )
-        body = r.json()
-        if not body.get("ok"):
-            log.error("Slack rejected alert: %s", body.get("error"))
-    except Exception as e:  # noqa: BLE001 — alerting must never break a request
-        log.error("Slack alert failed: %s", e)
+    if delivered and until is not None:
+        async with _lock:
+            _suppressed[key] = until
+            _save()
 
 
-def _fmt_reset(ts: int | None) -> str:
+def _usable_reset(resets, now: float) -> float | None:
+    """Return resets as a float only if it is a sane future timestamp."""
+    if isinstance(resets, bool) or not isinstance(resets, (int, float)):
+        return None
+    if not math.isfinite(resets):
+        return None
+    if resets <= now or resets >= now + _MAX_RESET_AHEAD_S:
+        return None
+    return float(resets)
+
+
+def _fmt_reset(ts) -> str:
     if not ts:
         return "unknown"
-    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))
+    try:
+        return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "unknown"
 
 
 async def on_rate_limit(info) -> None:
@@ -95,20 +181,26 @@ async def on_rate_limit(info) -> None:
     util = getattr(info, "utilization", None)
     pct = f"{util * 100:.0f}% used · " if isinstance(util, (int, float)) else ""
 
+    usable = _usable_reset(resets, time.time())
+
     if status == "rejected":
         await alert(
             f"quota:{kind}:{resets}",
             f"*Claude seat quota exhausted* (`{kind}`). {pct}"
-            f"Generation is failing now; resets {_fmt_reset(resets)}. "
-            f"Embeddings are unaffected. Fall back by pointing agent-mem at OpenRouter.",
+            f"Generation is failing now; resets {_fmt_reset(usable)}. "
+            f"Embeddings are unaffected. Fall back by pointing agent-mem at OpenRouter."
+            + (" Muted until the reset." if usable is not None else ""),
             critical=True,
+            until=usable,
         )
     else:
         await alert(
             f"quota-warn:{kind}:{resets}",
             f"*Claude seat quota running low* (`{kind}`). {pct}"
-            f"Window resets {_fmt_reset(resets)}.",
+            f"Window resets {_fmt_reset(usable)}."
+            + (" Muted until the reset." if usable is not None else ""),
             critical=False,
+            until=usable,
         )
 
 
