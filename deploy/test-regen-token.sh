@@ -98,7 +98,7 @@ done
 # 3. invalid input
 for v in "empty:" "hello:hello" "internal space:sk-ant-oat01-A B" "two lines:$NEW"$'\n'"$NEW"$'\n'; do
   mkcase "$BASE"; before=$(sum); run_script "${v#*:}"
-  ok "$RC" 2 rc; ok "$(sum)" "$before" unchanged; ok "$(wc -c < "$T/docker.log" | tr -d ' ')" 0 "docker calls"
+  ok "$RC" 2 rc; ok "$(sum)" "$before" unchanged; ok "$(restarts)" 0 "no restart"; ok "$(generated)" 0 "no generate"
   ok "$(leftovers)" 0 leftovers; nosecrets; done_case "invalid input (${v%%:*})"
 done
 
@@ -106,6 +106,7 @@ done
 shape() {
   mkcase "$2"; run_script "$NEW"
   ok "$RC" 0 rc; ok "$(eff)" "$TK=$NEW" eff; nosecrets
+  ok "$(cat "$T/config/.env"; echo x)" "$3"$'\nx' content
   ok "$(grep -cE "^[[:space:]]*(export )?CLAUDE_CODE_OAUTH_ ?TOKEN" "$T/config/.env")" 1 "token lines"
   done_case "shape: $1"
 }
@@ -203,7 +204,7 @@ done_case "rollback keeps token empty"
 # 12. lock
 mkcase "$BASE"; mkdir "$T/config/.regen-token.lock"; BEFORE=$(sum); run_script "$NEW"
 ok "$RC" 3 rc; ok "$(sum)" "$BEFORE" unchanged; [ -d "$T/config/.regen-token.lock" ] || ERRS+=" [lock removed]"
-ok "$(wc -c < "$T/docker.log" | tr -d ' ')" 0 "docker calls"; nosecrets; done_case "lock held"
+ok "$(restarts)" 0 "no restart"; ok "$(generated)" 0 "no generate"; nosecrets; done_case "lock held"
 
 # FR1: failed write inside set_token must fail, not install a truncated file
 filler=$(printf 'FILLER_%.0s=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n' $(seq 40))
@@ -233,8 +234,13 @@ if command -v script >/dev/null; then
   nosecrets; done_case "interactive: claude missing"
   mkcase "$BASE"; BEFORE=$(sum); printf '#!/bin/sh\nexit 1\n' > "$T/bin/claude"; chmod +x "$T/bin/claude"
   OUT=$(cd "$T" && PATH="$(SPATH)" STUB_DIR="$T" script -q /dev/null bash deploy/regen-token.sh </dev/null 2>&1); RC=$?
-  has "$OUT" "claude setup-token failed" msg; ok "$(sum)" "$BEFORE" unchanged; ok "$(wc -c < "$T/docker.log" | tr -d ' ')" 0 "docker calls"
+  has "$OUT" "claude setup-token failed" msg; ok "$(sum)" "$BEFORE" unchanged; ok "$(restarts)" 0 "no restart"; ok "$(generated)" 0 "no generate"
   nosecrets; done_case "interactive: claude exits 1"
+  mkcase "$BASE"; BEFORE=$(sum); printf '#!/bin/sh\ntouch "$STUB_DIR/claude.called"\nexit 0\n' > "$T/bin/claude"; chmod +x "$T/bin/claude"
+  OUT=$(cd "$T" && PATH="$(SPATH)" STUB_DIR="$T" STUB_WORKDIR=/nonexistent/other-checkout script -q /dev/null bash deploy/regen-token.sh </dev/null 2>&1); RC=$?
+  ok "$RC" 2 rc; has "$OUT" "belongs to /nonexistent/other-checkout" msg; ok "$(sum)" "$BEFORE" unchanged
+  [ ! -e "$T/claude.called" ] || ERRS+=" [claude was called]"; ok "$(restarts)" 0 "no restart"
+  nosecrets; done_case "interactive: wrong checkout never asks for a token"
 else
   echo "FAIL interactive: script(1) not available"; FAILS=$((FAILS+1))
 fi

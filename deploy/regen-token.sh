@@ -17,6 +17,21 @@ LOCK=config/.regen-token.lock
 KEY=CLAUDE_CODE_OAUTH_TOKEN
 log() { echo "$(date '+%F %T') $*"; }
 
+# The running container must mount THIS checkout's config/.env. Read-only
+# (compose ps, inspect), so no lock needed; runs before a token is requested.
+check_checkout() {
+  local cid live live_phys
+  cid=$(docker compose ps -q "$SERVICE" 2>/dev/null) || cid=
+  if [[ -z $cid ]]; then echo "no running $SERVICE container; start it first" >&2; exit 2; fi
+  live=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$cid" 2>/dev/null) || live=
+  live_phys=$(cd "$live" 2>/dev/null && pwd -P) || live_phys=$live
+  if [[ -z $live || $live_phys != "$(pwd -P)" ]]; then
+    echo "the running container belongs to ${live:-an unknown directory}; run this script from there" >&2
+    exit 2
+  fi
+}
+check_checkout
+
 # ---- get and validate the token (nothing is touched yet) -------------------
 if [[ -t 0 ]]; then
   command -v claude >/dev/null 2>&1 || { echo "claude CLI not found on PATH" >&2; exit 2; }
@@ -42,15 +57,6 @@ tmp=
 cleanup() { [[ -n $tmp ]] && rm -f -- "$tmp"; rmdir "$LOCK" 2>/dev/null || true; }
 trap cleanup EXIT
 
-# The running container must mount THIS checkout's config/.env.
-cid=$(docker compose ps -q "$SERVICE" 2>/dev/null) || cid=
-if [[ -z $cid ]]; then echo "no running $SERVICE container; start it first" >&2; exit 2; fi
-live=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$cid" 2>/dev/null) || live=
-live_phys=$(cd "$live" 2>/dev/null && pwd -P) || live_phys=$live
-if [[ -z $live || $live_phys != "$(pwd -P)" ]]; then
-  echo "the running container belongs to ${live:-an unknown directory}; run this script from there" >&2
-  exit 2
-fi
 
 # ponytail: a PUT /config landing between this script's read and its rename can
 # be lost. Rotation is a rare manual step; an app-side lock is the upgrade path.
