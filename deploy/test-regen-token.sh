@@ -20,9 +20,10 @@ mkcase() { # sets T; $1 = env file content
 #!/bin/bash
 echo "$*" >> "$STUB_DIR/docker.log"
 case "$1 $2" in
-  "compose ps") echo fakeid ;;
+  "compose ps") [ "${STUB_NO_CONTAINER:-}" = 1 ] || echo fakeid ;;
   "compose restart")
     n=$(( $(cat "$STUB_DIR/restart.n" 2>/dev/null || echo 0) + 1 )); echo $n > "$STUB_DIR/restart.n"
+    [ "${STUB_RESTART_SLEEP_ON:-}" = "$n" ] && /bin/sleep 2
     [ "${STUB_RESTART_FAIL_ON:-}" = "$n" ] && exit 1; exit 0 ;;
   "compose exec")
     echo GENERATE >> "$STUB_DIR/docker.log"
@@ -30,9 +31,12 @@ case "$1 $2" in
     def='{"backend":"claude","text":"ok"}'
     printf '%s' "${STUB_GENERATE-$def}"
     exit "${STUB_EXEC_RC:-0}" ;;
-  inspect*) [ "${STUB_UNHEALTHY:-}" = 1 ] && echo starting || echo healthy ;;
-  *) case "$1" in inspect) [ "${STUB_UNHEALTHY:-}" = 1 ] && echo starting || echo healthy ;;
-       *) echo "unexpected docker call"; exit 99 ;; esac ;;
+  inspect*)
+    case "$*" in
+      *working_dir*) if [ -n "${STUB_WORKDIR+x}" ]; then echo "$STUB_WORKDIR"; else (cd "$STUB_DIR" && pwd -P); fi ;;
+      *) [ "${STUB_UNHEALTHY:-}" = 1 ] && echo starting || echo healthy ;;
+    esac ;;
+  *) echo "unexpected docker call"; exit 99 ;;
 esac
 EOF
   cat > "$T/bin/mv" <<'EOF'
@@ -78,7 +82,7 @@ outcomes() { printf '%s\n' "$OUT" | grep -c '^new token failed'; }
 # 1. bash -n
 bash -n "$REPO/deploy/regen-token.sh" 2>/dev/null; a=$?
 bash -n "$REPO/deploy/test-regen-token.sh" 2>/dev/null; b=$?
-ok "$a$b" 00 "bash -n"; done_case "bash -n both scripts"
+OUT=; nosecrets; ok "$a$b" 00 "bash -n"; done_case "bash -n both scripts"
 
 # 2. success variants
 for v in "newline:$NEW"$'\n' "nonewline:$NEW" "spaces:  $NEW  "; do
@@ -101,8 +105,7 @@ done
 # 4. file shapes: name|input|expected
 shape() {
   mkcase "$2"; run_script "$NEW"
-  ok "$RC" 0 rc; ok "$(eff)" "$TK=$NEW" eff
-  ok "$(cat "$T/config/.env"; echo x)" "$3"$'\nx' content
+  ok "$RC" 0 rc; ok "$(eff)" "$TK=$NEW" eff; nosecrets
   ok "$(grep -cE "^[[:space:]]*(export )?CLAUDE_CODE_OAUTH_ ?TOKEN" "$T/config/.env")" 1 "token lines"
   done_case "shape: $1"
 }
@@ -147,17 +150,31 @@ mkcase "$BASE"; BEFORE=$(sum); run_script "$NEW" STUB_RESTART_FAIL_ON=2 STUB_GEN
 rolled; has "$OUT" "restart/health failed" outcome; done_case "rollback restart fails"
 
 # 9. interrupts
-mkcase "$BASE"; BEFORE=$(sum)
-(cd "$T" && printf '%s' "$NEW" | env PATH="$(SPATH)" STUB_DIR="$T" STUB_EXEC_SLEEP=3 \
-  perl -e '$SIG{INT}="DEFAULT"; exec @ARGV' bash deploy/regen-token.sh > "$T/out" 2>&1) &
+mkcase "$BASE"; BEFORE=$(sum); printf '%s' "$NEW" > "$T/in"
+(cd "$T" && exec env PATH="$(SPATH)" STUB_DIR="$T" STUB_EXEC_SLEEP=3 \
+  perl -e 'setpgrp(0,0); $SIG{INT}="DEFAULT"; exec @ARGV' bash deploy/regen-token.sh) < "$T/in" > "$T/out" 2>&1 &
 pid=$!
 for _ in $(seq 100); do grep -q '^GENERATE$' "$T/docker.log" && break; /bin/sleep 0.1; done
-pkill -INT -f "bash deploy/regen-token.sh" 2>/dev/null
+kill -INT -- "-$pid" 2>/dev/null
 wait $pid; RC=$?; OUT=$(cat "$T/out")
 [ "$RC" -ne 0 ] || ERRS+=" [rc zero]"
 ok "$(eff)" "$TK=$OLD" "old token back"; ok "$(sum)" "$BEFORE" "file restored"; ok "$(outcomes)" 1 "one outcome"
 ok "$(leftovers)" 0 leftovers; ok "$(restarts)" 2 "one rollback restart"; nosecrets
 done_case "interrupt SIGINT during generate"
+
+# FR2: second SIGINT to the process group while rollback is running
+mkcase "$BASE"; BEFORE=$(sum); printf '%s' "$NEW" > "$T/in"
+(cd "$T" && exec env PATH="$(SPATH)" STUB_DIR="$T" STUB_GENERATE="$OR" STUB_RESTART_SLEEP_ON=2 \
+  perl -e 'setpgrp(0,0); $SIG{INT}="DEFAULT"; exec @ARGV' bash deploy/regen-token.sh) < "$T/in" > "$T/out" 2>&1 &
+pid=$!
+for _ in $(seq 100); do [ "$(restarts)" = 2 ] && break; /bin/sleep 0.1; done
+kill -INT -- "-$pid" 2>/dev/null; /bin/sleep 0.3; kill -INT -- "-$pid" 2>/dev/null
+wait $pid; RC=$?; OUT=$(cat "$T/out")
+ok "$RC" 1 rc; has "$OUT" "rolling back to the previous token" "rollback notice"
+has "$OUT" "service healthy" outcome
+ok "$(eff)" "$TK=$OLD" "old token back"; ok "$(sum)" "$BEFORE" "file restored"; ok "$(outcomes)" 1 "one outcome"
+ok "$(leftovers)" 0 leftovers; nosecrets
+done_case "second SIGINT during rollback"
 
 mkcase "$BASE"; BEFORE=$(sum); run_script "$NEW" STUB_MV_KILL_ON=1
 [ "$RC" -ne 0 ] || ERRS+=" [rc zero]"
@@ -188,16 +205,36 @@ mkcase "$BASE"; mkdir "$T/config/.regen-token.lock"; BEFORE=$(sum); run_script "
 ok "$RC" 3 rc; ok "$(sum)" "$BEFORE" unchanged; [ -d "$T/config/.regen-token.lock" ] || ERRS+=" [lock removed]"
 ok "$(wc -c < "$T/docker.log" | tr -d ' ')" 0 "docker calls"; nosecrets; done_case "lock held"
 
+# FR1: failed write inside set_token must fail, not install a truncated file
+filler=$(printf 'FILLER_%.0s=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n' $(seq 40))
+mkcase "$filler"$'\n'"$TK=$OLD"$'\n'; BEFORE=$(sum)
+[ "$(wc -c < "$T/config/.env" | tr -d ' ')" -gt 2048 ] || ERRS+=" [env file too small]"
+OUT=$(cd "$T" && trap "" XFSZ && ulimit -f 1 && printf '%s' "$NEW" | env PATH="$(SPATH)" STUB_DIR="$T" bash deploy/regen-token.sh 2>&1); RC=$?
+[ "$RC" -ne 0 ] || ERRS+=" [rc zero]"
+ok "$(sum)" "$BEFORE" "file unchanged"; ok "$(eff)" "$TK=$OLD" "old token"; ok "$(leftovers)" 0 leftovers
+ok "$(restarts)" 0 "no restart"; nosecrets
+done_case "write failure (ulimit -f) leaves env file intact"
+
+# FR3: running container belongs to another checkout
+mkcase "$BASE"; BEFORE=$(sum); run_script "$NEW" STUB_WORKDIR=/nonexistent/other-checkout
+ok "$RC" 2 rc; has "$OUT" "belongs to /nonexistent/other-checkout" msg; ok "$(sum)" "$BEFORE" unchanged
+ok "$(restarts)" 0 "no restart"; ok "$(generated)" 0 "no generate"; ok "$(leftovers)" 0 leftovers; nosecrets
+done_case "wrong checkout"
+mkcase "$BASE"; BEFORE=$(sum); run_script "$NEW" STUB_NO_CONTAINER=1
+ok "$RC" 2 rc; has "$OUT" "no running" msg; ok "$(sum)" "$BEFORE" unchanged; ok "$(restarts)" 0 "no restart"
+ok "$(leftovers)" 0 leftovers; nosecrets
+done_case "no container running"
+
 # 14. interactive branch through a PTY
 if command -v script >/dev/null; then
   mkcase "$BASE"; BEFORE=$(sum)
   OUT=$(cd "$T" && PATH="$(SPATH)" STUB_DIR="$T" script -q /dev/null bash deploy/regen-token.sh </dev/null 2>&1); RC=$?
   has "$OUT" "claude CLI not found" msg; ok "$(sum)" "$BEFORE" unchanged
-  done_case "interactive: claude missing"
+  nosecrets; done_case "interactive: claude missing"
   mkcase "$BASE"; BEFORE=$(sum); printf '#!/bin/sh\nexit 1\n' > "$T/bin/claude"; chmod +x "$T/bin/claude"
   OUT=$(cd "$T" && PATH="$(SPATH)" STUB_DIR="$T" script -q /dev/null bash deploy/regen-token.sh </dev/null 2>&1); RC=$?
   has "$OUT" "claude setup-token failed" msg; ok "$(sum)" "$BEFORE" unchanged; ok "$(wc -c < "$T/docker.log" | tr -d ' ')" 0 "docker calls"
-  done_case "interactive: claude exits 1"
+  nosecrets; done_case "interactive: claude exits 1"
 else
   echo "FAIL interactive: script(1) not available"; FAILS=$((FAILS+1))
 fi

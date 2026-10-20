@@ -42,6 +42,16 @@ tmp=
 cleanup() { [[ -n $tmp ]] && rm -f -- "$tmp"; rmdir "$LOCK" 2>/dev/null || true; }
 trap cleanup EXIT
 
+# The running container must mount THIS checkout's config/.env.
+cid=$(docker compose ps -q "$SERVICE" 2>/dev/null) || cid=
+if [[ -z $cid ]]; then echo "no running $SERVICE container; start it first" >&2; exit 2; fi
+live=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$cid" 2>/dev/null) || live=
+live_phys=$(cd "$live" 2>/dev/null && pwd -P) || live_phys=$live
+if [[ -z $live || $live_phys != "$(pwd -P)" ]]; then
+  echo "the running container belongs to ${live:-an unknown directory}; run this script from there" >&2
+  exit 2
+fi
+
 # ponytail: a PUT /config landing between this script's read and its rename can
 # be lost. Rotation is a rare manual step; an app-side lock is the upgrade path.
 
@@ -61,24 +71,24 @@ set_token() {
   local present=$1 value=$2 line nl done_=0 last_nl=1
   [[ -z $tmp ]] || rm -f -- "$tmp"
   tmp=$(umask 077; mktemp config/.regen-token.XXXXXX) || return 1
-  {
+  (
     while IFS= read -r line || { [[ -n $line ]] && nl=0; }; do
       nl=${nl:-1}
       if is_token_line "$line"; then
         if [[ $present == 1 && $done_ == 0 ]]; then
-          printf '%s=%s\n' "$KEY" "$value"; done_=1; last_nl=1
+          printf '%s=%s\n' "$KEY" "$value" || exit 1; done_=1; last_nl=1
         fi
       else
-        if [[ $nl == 1 ]]; then printf '%s\n' "$line"; last_nl=1
-        else printf '%s' "$line"; last_nl=0; fi
+        if [[ $nl == 1 ]]; then printf '%s\n' "$line" || exit 1; last_nl=1
+        else printf '%s' "$line" || exit 1; last_nl=0; fi
       fi
       unset nl
     done < "$ENV_FILE"
     if [[ $present == 1 && $done_ == 0 ]]; then
-      [[ $last_nl == 1 ]] || printf '\n'
-      printf '%s=%s\n' "$KEY" "$value"
+      if [[ $last_nl != 1 ]]; then printf '\n' || exit 1; fi
+      printf '%s=%s\n' "$KEY" "$value" || exit 1
     fi
-  } > "$tmp" || return 1
+  ) > "$tmp" || return 1
   mv "$tmp" "$ENV_FILE" || return 1
   tmp=
 }
@@ -115,12 +125,14 @@ sys.exit(0 if b == "claude" and isinstance(t, str) and t.strip() else 4)'
 phase=pre step=
 on_fail() {
   local rc=$1
-  trap - ERR INT TERM
+  trap - ERR
+  trap '' INT TERM
   step=${step:-unexpected error}
   if [[ $phase != written ]]; then
     echo "failed: $step" >&2
     exit "$rc"
   fi
+  echo "rolling back to the previous token..." >&2
   if set_token "$old_present" "$old_value"; then
     if restart && healthy; then
       echo "new token failed: $step. Old token restored, service healthy."
