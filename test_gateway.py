@@ -948,7 +948,9 @@ def test_generate_logs_each_outcome_once() -> None:
         duration = next(part for part in message.split() if part.startswith("duration_ms="))
         assert duration.removeprefix("duration_ms=").isdigit(), message
 
+    original_callers = main.callers
     try:
+        main.callers = {}
         main.quota = _Quota()
         config.BACKEND_CHEAP = "claude"
         config.MODEL_CHEAP = "claude-model"
@@ -1000,7 +1002,9 @@ def test_generate_logs_each_outcome_once() -> None:
             claude.generate = blocked
             config.BACKEND_CHEAP = "claude"
             config.FALLBACK_ON_QUOTA = False
-            task = asyncio.create_task(main.generate(main.GenerateIn(user="prompt", tier="cheap")))
+            task = asyncio.create_task(
+                main.generate(main.GenerateIn(user="prompt", tier="cheap"), caller="test/cancel")
+            )
             await started.wait()
             task.cancel()
             try:
@@ -1013,12 +1017,16 @@ def test_generate_logs_each_outcome_once() -> None:
             asyncio.run(cancel_generate())
         assert_log(
             records,
+            "caller=test/cancel",
             "backend=claude",
             "model=claude-model",
             "status=cancelled",
             "reason=external_cancelled",
         )
+        assert main.callers["test/cancel"]["calls"] == 1
+        assert main.callers["test/cancel"]["errors"] == 1
     finally:
+        main.callers = original_callers
         claude.generate = original_claude_generate
         openrouter.generate = original_openrouter_generate
         main.quota = original_quota
@@ -1308,6 +1316,265 @@ def test_alert_non_quota_alerts_unchanged() -> None:
         ctl.now = 2801.0
         asyncio.run(alerts.on_openrouter_error(429, ""))
         assert len(posts) == 2
+
+
+# ── caller label ─────────────────────────────────────────────────────────────
+
+
+@contextmanager
+def caller_env(backend_describe: str = "claude", fallback: bool = True):
+    """Fresh caller store + quota, config and backend stubs; everything restored after."""
+    saved = (
+        main.callers, main.quota, claude.generate, claude.describe,
+        openrouter.generate, openrouter.describe, openrouter.embed, openrouter.key_usage,
+        config.BACKEND_CHEAP, config.BACKEND_DESCRIBE, config.FALLBACK_ON_QUOTA,
+    )
+    main.callers = {}
+    main.quota = _Quota()
+    config.BACKEND_CHEAP = "claude"
+    config.BACKEND_DESCRIBE = backend_describe
+    config.FALLBACK_ON_QUOTA = fallback
+
+    async def ok_claude(**kw):
+        return {"text": "ok", "meta": {"cost_usd": 0.01}}
+
+    async def ok_or(**kw):
+        return {"text": "ok", "meta": {}}
+
+    async def ok_embed(texts, dims):
+        return [[0.0]] * len(texts)
+
+    async def usage_stub():
+        return {"limit": 10, "usage": 1}
+
+    claude.generate = ok_claude
+    claude.describe = ok_claude
+    openrouter.generate = ok_or
+    openrouter.describe = ok_or
+    openrouter.embed = ok_embed
+    openrouter.key_usage = usage_stub
+    try:
+        yield
+    finally:
+        (
+            main.callers, main.quota, claude.generate, claude.describe,
+            openrouter.generate, openrouter.describe, openrouter.embed, openrouter.key_usage,
+            config.BACKEND_CHEAP, config.BACKEND_DESCRIBE, config.FALLBACK_ON_QUOTA,
+        ) = saved
+
+
+def _post(path: str, body: dict, caller: str | None = None, raise_exc: bool = True):
+    headers = {"X-API-Key": config.API_KEY}
+    if caller is not None:
+        headers["X-LLM-Caller"] = caller
+    return TestClient(app, raise_server_exceptions=raise_exc).post(path, headers=headers, json=body)
+
+
+GEN = {"user": "p", "tier": "cheap"}
+DESC = {"prompt": "p", "mime": "image/png", "data_b64": "AAAA"}
+
+
+def _summaries(records, name: str) -> list[str]:
+    return [r.getMessage() for r in records if r.getMessage().startswith(f"{name} caller=")]
+
+
+def test_caller_generate_labelled_and_counted() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        assert _post("/generate", GEN, "p-agent/bot-comment").status_code == 200
+        (msg,) = _summaries(records, "generate")
+        assert "caller=p-agent/bot-comment" in msg and "status=200" in msg
+        c = main.callers["p-agent/bot-comment"]
+        assert (c["calls"], c["errors"], c["cost_usd"]) == (1, 0, 0.01)
+        _post("/generate", GEN)
+        assert main.callers["unknown"]["calls"] == 1
+
+
+def test_caller_invalid_labels_become_unknown() -> None:
+    bad = ["P-Agent", "has space", "/lead", "a" * 65]
+    with caller_env(), captured_gateway_logs() as records:
+        for value in bad + [""]:
+            assert _post("/generate", GEN, value).status_code == 200
+        msgs = _summaries(records, "generate")
+        assert len(msgs) == 5 and all("caller=unknown" in m for m in msgs)
+        assert not any("caller= " in m for m in msgs)
+        for r in records:
+            text = r.getMessage() + repr(r.args)
+            assert not any(v in text for v in bad)
+        assert main.callers["unknown"]["calls"] == 5
+
+
+def test_caller_generate_error_counted() -> None:
+    with caller_env(fallback=False), captured_gateway_logs() as records:
+        _post("/generate", GEN, "x")
+
+        async def fail(**kw):
+            raise claude.ClaudeError("boom")
+
+        claude.generate = fail
+        assert _post("/generate", GEN, "x").status_code == 502
+        msgs = _summaries(records, "generate")
+        assert len(msgs) == 2 and "status=502" in msgs[1]
+        c = main.callers["x"]
+        assert c["calls"] == 2 and c["errors"] == 1 and round(c["cost_usd"], 4) == 0.01
+
+
+def test_caller_describe_outcomes() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        # 5: claude ok
+        async def cl(**kw):
+            return {"text": "ok", "meta": {"cost_usd": 0.002}}
+
+        claude.describe = cl
+        assert _post("/describe", DESC, "d").status_code == 200
+        (msg,) = _summaries(records, "describe")
+        assert "backend=claude mime=image/png status=200 reason=none" in msg
+        assert main.callers["d"]["cost_usd"] == 0.002
+
+    # 6: openrouter direct
+    with caller_env("openrouter"), captured_gateway_logs() as records:
+        assert _post("/describe", DESC, "d").status_code == 200
+        (msg,) = _summaries(records, "describe")
+        assert "backend=openrouter" in msg and "status=200" in msg
+        assert main.callers["d"]["cost_usd"] == 0
+
+    # 7: claude error, fallback ok, plus the diagnostic
+    with caller_env(), captured_gateway_logs() as records:
+        async def fail(**kw):
+            raise claude.ClaudeError("boom")
+
+        claude.describe = fail
+        assert _post("/describe", DESC, "d").status_code == 200
+        (msg,) = _summaries(records, "describe")
+        assert "backend=openrouter" in msg and "status=200 reason=claude_error" in msg
+        assert any("claude describe failed" in r.getMessage() for r in records)
+        c = main.callers["d"]
+        assert (c["calls"], c["errors"], c["cost_usd"]) == (1, 0, 0)
+
+    # 8: seat pre-blocked
+    with caller_env(), captured_gateway_logs() as records:
+        main.quota.blocked_until = 4e12
+        assert _post("/describe", DESC, "d").status_code == 200
+        (msg,) = _summaries(records, "describe")
+        assert "reason=seat_unavailable" in msg and "status=200" in msg
+        assert main.callers["d"]["calls"] == 1
+
+    # 9: openrouter error
+    with caller_env("openrouter"), captured_gateway_logs() as records:
+        async def fail(**kw):
+            raise openrouter.OpenRouterError("boom")
+
+        openrouter.describe = fail
+        assert _post("/describe", DESC, "d").status_code == 502
+        (msg,) = _summaries(records, "describe")
+        assert "status=502 reason=openrouter_error" in msg
+        assert (main.callers["d"]["calls"], main.callers["d"]["errors"]) == (1, 1)
+
+
+def test_caller_describe_mime_cannot_forge_log() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        body = {**DESC, "mime": "image/png\nforged caller=x"}
+        _post("/describe", body, "d")
+        (msg,) = _summaries(records, "describe")
+        assert "mime=invalid" in msg and "\n" not in msg and "\r" not in msg
+        assert "forged" not in msg
+        assert main.callers["d"]["calls"] == 1
+
+
+def test_caller_embed() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        assert _post("/embed", {"texts": ["a", "b"]}, "e").status_code == 200
+        assert _post("/embed", {"texts": []}, "e").status_code == 200
+
+        async def fail(texts, dims):
+            raise openrouter.OpenRouterError("boom")
+
+        openrouter.embed = fail
+        assert _post("/embed", {"texts": ["a"]}, "e").status_code == 502
+        msgs = _summaries(records, "embed")
+        assert len(msgs) == 3
+        assert "texts=2 status=200" in msgs[0]
+        assert "texts=0 status=200" in msgs[1]
+        assert "status=502 reason=openrouter_error" in msgs[2]
+        assert (main.callers["e"]["calls"], main.callers["e"]["errors"]) == (3, 1)
+
+
+def test_caller_unexpected_exception() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        async def boom(**kw):
+            raise RuntimeError("boom")
+
+        claude.generate = boom
+        assert _post("/generate", GEN, "u", raise_exc=False).status_code == 500
+        (msg,) = _summaries(records, "generate")
+        assert "status=500 reason=unexpected_error" in msg
+        assert (main.callers["u"]["calls"], main.callers["u"]["errors"]) == (1, 1)
+
+
+def test_caller_rejected_requests_not_counted() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        r = TestClient(app).post("/generate", headers={"X-API-Key": "wrong"}, json=GEN)
+        assert r.status_code == 401
+        assert _post("/generate", {"tier": "cheap"}, "x").status_code == 422
+        assert _summaries(records, "generate") == []
+        assert main.callers == {}
+
+
+def test_caller_cost_rules_and_rounding() -> None:
+    with caller_env():
+        for cost in ("x", None):
+            async def cl(cost=cost, **kw):
+                meta = {} if cost is None else {"cost_usd": cost}
+                return {"text": "ok", "meta": meta}
+
+            claude.generate = cl
+            _post("/generate", GEN, "c")
+        assert main.callers["c"]["cost_usd"] == 0
+
+        async def tiny(**kw):
+            return {"text": "ok", "meta": {"cost_usd": 0.00001}}
+
+        claude.generate = tiny
+        for _ in range(3):
+            _post("/generate", GEN, "tiny")
+
+        async def big(**kw):
+            return {"text": "ok", "meta": {"cost_usd": 0.12345}}
+
+        claude.generate = big
+        _post("/generate", GEN, "big")
+        callers = TestClient(app).get("/usage", headers={"X-API-Key": config.API_KEY}).json()["callers"]
+        assert callers["tiny"]["notional_cost_usd"] == 0.0
+        assert callers["big"]["notional_cost_usd"] == 0.1235
+        assert callers["c"]["notional_cost_usd"] == 0
+
+
+def test_caller_bucket_limit() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        for i in range(64):
+            _post("/generate", GEN, f"c{i}")
+        _post("/generate", GEN, "late")
+        _post("/generate", GEN, "c0")
+        _post("/generate", GEN)
+        _post("/generate", GEN, "other")
+        assert "caller=late" in _summaries(records, "generate")[64]
+        assert "late" not in main.callers
+        assert main.callers["other"]["calls"] == 2
+        assert main.callers["c0"]["calls"] == 2
+        assert main.callers["unknown"]["calls"] == 1
+        assert len(main.callers) == 66
+
+
+def test_usage_reports_callers_sorted() -> None:
+    with caller_env():
+        _post("/generate", GEN, "zeta")
+        _post("/generate", GEN, "alpha")
+        body = TestClient(app).get("/usage", headers={"X-API-Key": config.API_KEY}).json()
+        assert list(body["callers"]) == ["alpha", "zeta"]
+        assert set(body["callers"]["alpha"]) == {"calls", "errors", "notional_cost_usd"}
+        assert set(body["seat"]) == {
+            "available", "last_rate_limit", "calls", "notional_cost_usd", "openrouter_fallbacks",
+        }
+        assert set(body["openrouter"]) >= {"limit", "usage", "limit_remaining"}
 
 
 if __name__ == "__main__":
