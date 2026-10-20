@@ -214,6 +214,12 @@ setup-token` gives you a token you probably exported in `~/.zshrc`. The
 container inherits nothing from your shell rc, so `CLAUDE_CODE_OAUTH_TOKEN` has
 to live in `config/.env` (loaded via `env_file`). Still true.
 
+*Rotating the Claude token.* Run `deploy/regen-token.sh` from the checkout that
+owns the running container (on the Mac mini, `~/src/github.com/llm-gateway`), or
+`pbpaste | deploy/regen-token.sh` with a token already on the clipboard. It
+swaps the token in `config/.env`, restarts, checks a real Claude answer, and
+rolls back on failure. Do not run it in a recorded or shared terminal.
+
 **2 · Bridge-IP binding — no longer applies.** The native service had to bind
 the `agent-mem_default` gateway `172.18.0.1` because the worker could not reach
 the host loopback. On the shared network the worker resolves the container by
