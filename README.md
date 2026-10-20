@@ -42,6 +42,26 @@ All routes except `/health` require `X-API-Key`.
 | `GET /config` | — | current editable, non-secret runtime configuration |
 | `PUT /config` | — | partial configuration update, applied live and persisted to `.env` |
 | `GET /health` | — | quota state, counters, active backends |
+| `GET /usage` | — | seat and OpenRouter budget, plus per-caller `callers` counters |
+
+Every request to `/generate`, `/describe` and `/embed` may carry an optional
+`X-LLM-Caller` header naming who made it, e.g. `p-agent/bot-comment` or
+`agent-mem`. It must match `^[a-z0-9][a-z0-9/_-]{0,63}$` (lowercase letters,
+digits, `/`, `_`, `-`; 1-64 characters). A missing, empty or malformed value is
+recorded as `unknown`; it is never trimmed or lower-cased to rescue it. The label
+appears in each request's log line (`generate caller=… `, `describe caller=… `,
+`embed caller=… `) and in per-caller counters. It is self-asserted by an
+already authenticated caller: a bookkeeping label, not authentication.
+
+`unknown` and `other` are reserved buckets: a caller that sends the literal label
+`unknown` or `other` lands in that shared bucket. Up to 64 other distinct labels
+get their own counter; further new labels are counted in `other` (their log line
+still shows their own label). Requests rejected before the handler runs (401, 422)
+are not counted. Counters reset on process restart.
+
+`GET /usage` returns `seat`, `openrouter` and `callers`: a map, sorted by label, of
+`{calls, errors, notional_cost_usd}`. `errors` counts non-200 outcomes;
+`notional_cost_usd` sums the Claude seat's reported cost only.
 
 `/describe` takes an image (`image/png`, `image/jpeg`, `image/gif`,
 `image/webp`) or a PDF (`application/pdf`). A PDF goes to the model as a

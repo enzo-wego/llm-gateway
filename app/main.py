@@ -8,6 +8,7 @@ without touching agent-mem's gemini client at all.
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Literal
 
@@ -62,6 +63,57 @@ def require_key(x_api_key: str = Header(default="")) -> None:
         raise HTTPException(status_code=401, detail="bad or missing X-API-Key")
 
 
+# ── caller label ─────────────────────────────────────────────────────────────
+_CALLER_RE = re.compile(r"[a-z0-9][a-z0-9/_-]{0,63}")
+_MIME_RE = re.compile(r"[A-Za-z0-9.+-]{1,32}/[A-Za-z0-9.+-]{1,64}")
+_MAX_NAMED_CALLERS = 64
+_RESERVED = ("unknown", "other")
+
+# bucket -> {"calls", "errors", "cost_usd"}; since process start.
+callers: dict[str, dict[str, Any]] = {}
+
+
+def caller_label(x_llm_caller: str = Header(default="")) -> str:
+    """Self-asserted bookkeeping label; anything malformed becomes `unknown`."""
+    return x_llm_caller if _CALLER_RE.fullmatch(x_llm_caller) else "unknown"
+
+
+def _meta_cost(meta: dict[str, Any]) -> float:
+    c = meta.get("cost_usd")
+    return float(c) if isinstance(c, (int, float)) else 0.0
+
+
+def _count_call(label: str, status: int | str, cost: float) -> None:
+    bucket = label
+    if bucket not in callers and bucket not in _RESERVED:
+        named = sum(1 for k in callers if k not in _RESERVED)
+        if named >= _MAX_NAMED_CALLERS:
+            bucket = "other"
+    entry = callers.setdefault(bucket, {"calls": 0, "errors": 0, "cost_usd": 0.0})
+    entry["calls"] += 1
+    if status != 200:
+        entry["errors"] += 1
+    entry["cost_usd"] += cost
+
+
+def _summarize(
+    fmt: str, caller: str, status: int | str, reason: str,
+    started: float, cost: float, *fields: Any,
+) -> None:
+    """Write the one summary record for a handler invocation and update the store.
+
+    Log args are: caller, *fields, status, reason, duration_ms.
+    """
+    duration_ms = int((time.monotonic() - started) * 1000)
+    level = (
+        logging.ERROR
+        if isinstance(status, int) and status >= 500
+        else logging.WARNING if reason != "none" else logging.INFO
+    )
+    log.log(level, fmt, caller, *fields, status, reason, duration_ms)
+    _count_call(caller, status, cost)
+
+
 # ── schemas ──────────────────────────────────────────────────────────────────
 Tier = Literal["summary", "cheap"]
 
@@ -107,13 +159,14 @@ def _active_model(tier: Tier) -> str:
 
 # ── routes ───────────────────────────────────────────────────────────────────
 @app.post("/generate", dependencies=[Depends(require_key)])
-async def generate(body: GenerateIn) -> dict[str, Any]:
+async def generate(body: GenerateIn, caller: str = Depends(caller_label)) -> dict[str, Any]:
     started = time.monotonic()
     backend, cmodel, ormodel, effort, thinking = _tier_config(body.tier)
     actual_backend = backend
     actual_model = cmodel if backend == "claude" else ormodel
     status: int | str = 500
     reason = "none"
+    cost = 0.0
 
     try:
         if backend == "claude" and quota.seat_available():
@@ -123,6 +176,7 @@ async def generate(body: GenerateIn) -> dict[str, Any]:
                     effort=effort, thinking=thinking, schema=body.schema_,
                 )
                 quota.record(res["meta"])
+                cost = _meta_cost(res["meta"])
                 status = 200
                 return {"backend": "claude", **res}
             except claude.QuotaExhausted as e:
@@ -162,65 +216,111 @@ async def generate(body: GenerateIn) -> dict[str, Any]:
             reason = "unexpected_error"
         raise
     finally:
-        duration_ms = int((time.monotonic() - started) * 1000)
-        level = (
-            logging.ERROR
-            if isinstance(status, int) and status >= 500
-            else logging.WARNING if reason != "none" else logging.INFO
-        )
-        log.log(
-            level,
-            "generate tier=%s backend=%s model=%s effort=%s status=%s reason=%s duration_ms=%d",
-            body.tier, actual_backend, actual_model, effort, status, reason, duration_ms,
+        _summarize(
+            "generate caller=%s tier=%s backend=%s model=%s effort=%s status=%s reason=%s duration_ms=%d",
+            caller, status, reason, started, cost, body.tier, actual_backend, actual_model, effort,
         )
 
 
 @app.post("/describe", dependencies=[Depends(require_key)])
-async def describe(body: DescribeIn) -> dict[str, Any]:
+async def describe(body: DescribeIn, caller: str = Depends(caller_label)) -> dict[str, Any]:
+    started = time.monotonic()
     backend = config.BACKEND_DESCRIBE
-
-    if backend == "claude" and quota.seat_available():
-        try:
-            res = await claude.describe(
-                system=body.system, prompt=body.prompt, mime=body.mime,
-                data_b64=body.data_b64, model=config.MODEL_CHEAP,
-                effort=config.EFFORT_CHEAP, thinking=config.THINKING_CHEAP,
-                schema=body.schema_,
-            )
-            quota.record(res["meta"])
-            return {"backend": "claude", **res}
-        except claude.QuotaExhausted as e:
-            quota.note_rejection((quota.last or {}).get("resets_at"))
-            if not config.FALLBACK_ON_QUOTA:
-                raise HTTPException(503, f"seat quota exhausted ({e})") from e
-            log.warning("seat quota exhausted (%s) — falling back to OpenRouter", e)
-        except claude.ClaudeError as e:
-            if not config.FALLBACK_ON_QUOTA:
-                raise HTTPException(502, str(e)) from e
-            log.error("claude describe failed (%s) — falling back to OpenRouter", e)
+    actual_backend = backend
+    status: int | str = 500
+    reason = "none"
+    cost = 0.0
 
     try:
-        res = await openrouter.describe(
-            prompt=body.prompt, mime=body.mime, data_b64=body.data_b64,
-            model=config.OR_MODEL_DESCRIBE, schema=body.schema_,
+        if backend == "claude" and quota.seat_available():
+            try:
+                res = await claude.describe(
+                    system=body.system, prompt=body.prompt, mime=body.mime,
+                    data_b64=body.data_b64, model=config.MODEL_CHEAP,
+                    effort=config.EFFORT_CHEAP, thinking=config.THINKING_CHEAP,
+                    schema=body.schema_,
+                )
+                quota.record(res["meta"])
+                cost = _meta_cost(res["meta"])
+                status = 200
+                return {"backend": "claude", **res}
+            except claude.QuotaExhausted as e:
+                reason = "quota_exhausted"
+                quota.note_rejection((quota.last or {}).get("resets_at"))
+                if not config.FALLBACK_ON_QUOTA:
+                    status = 503
+                    raise HTTPException(503, f"seat quota exhausted ({e})") from e
+                log.warning("seat quota exhausted (%s) — falling back to OpenRouter", e)
+            except claude.ClaudeError as e:
+                reason = e.reason
+                if not config.FALLBACK_ON_QUOTA:
+                    status = 502
+                    raise HTTPException(502, str(e)) from e
+                log.error("claude describe failed (%s) — falling back to OpenRouter", e)
+
+        if backend == "claude" and reason == "none":
+            reason = "seat_unavailable"
+        actual_backend = "openrouter"
+        try:
+            res = await openrouter.describe(
+                prompt=body.prompt, mime=body.mime, data_b64=body.data_b64,
+                model=config.OR_MODEL_DESCRIBE, schema=body.schema_,
+            )
+        except openrouter.OpenRouterError as e:
+            reason = "openrouter_error"
+            status = 502
+            raise HTTPException(502, str(e)) from e
+        if backend == "claude":
+            quota.fallbacks += 1
+        status = 200
+        return {"backend": "openrouter", **res}
+    except asyncio.CancelledError:
+        status = "cancelled"
+        reason = "external_cancelled"
+        raise
+    except Exception:
+        if reason == "none":
+            reason = "unexpected_error"
+        raise
+    finally:
+        mime = body.mime if _MIME_RE.fullmatch(body.mime) else "invalid"
+        _summarize(
+            "describe caller=%s backend=%s mime=%s status=%s reason=%s duration_ms=%d",
+            caller, status, reason, started, cost, actual_backend, mime,
         )
-    except openrouter.OpenRouterError as e:
-        raise HTTPException(502, str(e)) from e
-    if backend == "claude":
-        quota.fallbacks += 1
-    return {"backend": "openrouter", **res}
 
 
 @app.post("/embed", dependencies=[Depends(require_key)])
-async def embed(body: EmbedIn) -> dict[str, Any]:
+async def embed(body: EmbedIn, caller: str = Depends(caller_label)) -> dict[str, Any]:
     """Always OpenRouter — see openrouter.py for why there is no switch."""
-    if not body.texts:
-        return {"embeddings": [], "model": config.EMBED_MODEL}
+    started = time.monotonic()
+    status: int | str = 500
+    reason = "none"
     try:
-        vectors = await openrouter.embed(body.texts, body.dims)
-    except openrouter.OpenRouterError as e:
-        raise HTTPException(502, str(e)) from e
-    return {"embeddings": vectors, "model": config.EMBED_MODEL, "dims": body.dims}
+        if not body.texts:
+            status = 200
+            return {"embeddings": [], "model": config.EMBED_MODEL}
+        try:
+            vectors = await openrouter.embed(body.texts, body.dims)
+        except openrouter.OpenRouterError as e:
+            reason = "openrouter_error"
+            status = 502
+            raise HTTPException(502, str(e)) from e
+        status = 200
+        return {"embeddings": vectors, "model": config.EMBED_MODEL, "dims": body.dims}
+    except asyncio.CancelledError:
+        status = "cancelled"
+        reason = "external_cancelled"
+        raise
+    except Exception:
+        if reason == "none":
+            reason = "unexpected_error"
+        raise
+    finally:
+        _summarize(
+            "embed caller=%s texts=%d status=%s reason=%s duration_ms=%d",
+            caller, status, reason, started, 0.0, len(body.texts),
+        )
 
 
 @app.get("/usage", dependencies=[Depends(require_key)])
@@ -241,6 +341,14 @@ async def usage() -> dict[str, Any]:
             "calls": quota.calls,
             "notional_cost_usd": round(quota.cost_usd, 4),
             "openrouter_fallbacks": quota.fallbacks,
+        },
+        "callers": {
+            name: {
+                "calls": c["calls"],
+                "errors": c["errors"],
+                "notional_cost_usd": round(c["cost_usd"], 4),
+            }
+            for name, c in sorted(callers.items())
         },
     }
     try:
