@@ -1484,6 +1484,7 @@ def test_caller_embed() -> None:
     with caller_env(), captured_gateway_logs() as records:
         assert _post("/embed", {"texts": ["a", "b"]}, "e").status_code == 200
         assert _post("/embed", {"texts": []}, "e").status_code == 200
+        assert _post("/embed", {"texts": ["a", ""]}, "e").status_code == 422
 
         async def fail(texts, dims):
             raise openrouter.OpenRouterError("boom")
