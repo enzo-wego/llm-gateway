@@ -10,7 +10,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -138,7 +138,8 @@ class DescribeIn(BaseModel):
 
 
 class EmbedIn(BaseModel):
-    texts: list[str]
+    # OpenRouter answers 400 to an empty string, which would page as an alert.
+    texts: list[Annotated[str, Field(min_length=1)]]
     dims: int = 3072
 
 
