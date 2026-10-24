@@ -60,6 +60,7 @@ async def _post(path: str, payload: dict[str, Any], timeout: int, retry_429: boo
 
     if r.status_code != 200:
         body = r.text[:400]
+        log.warning("OpenRouter %s on %s, giving up", r.status_code, path)
         # 402 means the monthly cap is spent, which stops embedding writes and
         # therefore stops the graph growing. That has to reach Slack.
         await alerts.on_openrouter_error(r.status_code, body, path)

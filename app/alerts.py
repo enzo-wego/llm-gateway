@@ -230,9 +230,10 @@ async def on_openrouter_error(status: int, body: str, path: str = "") -> None:
         )
     elif status == 429:
         # Repeats inside the dedupe window never reach Slack, so point at the
-        # log lines that do show them.
+        # log lines that do show them. [4] keeps the grep from matching this
+        # alert's own log line.
         repeats = ("A single one is noise. To see repeats (this alert is deduped), run "
-                   "`docker compose logs --since 1h llm-gateway | grep 'OpenRouter 429'`.")
+                   "`docker compose logs --since 1h llm-gateway | grep 'OpenRouter [4]29 on'`.")
         if path == "/embeddings":
             text = ("*OpenRouter still rate-limited `/embeddings` after retries.* That call "
                     "failed, so its vector was not stored. " + repeats + " Many lines mean "
