@@ -10,6 +10,7 @@ to "openrouter", or when the seat's quota is spent and FALLBACK_ON_QUOTA is on.
 It reproduces what agent-mem does today.
 """
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -29,9 +30,29 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {config.OPENROUTER_KEY}", "Content-Type": "application/json"}
 
 
+# A 429 is a momentary rate limit that usually clears within seconds, so it is
+# retried rather than failed back to the caller. Only a 429 that survives every
+# retry reaches Slack.
+_RETRY_429_DELAYS_S = (1, 2, 4)
+_RETRY_AFTER_CAP_S = 10
+
+
+def _retry_after(r: httpx.Response, default: float) -> float:
+    try:
+        return min(float(r.headers["Retry-After"]), _RETRY_AFTER_CAP_S)
+    except (KeyError, ValueError):
+        return default
+
+
 async def _post(path: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.post(f"{config.OPENROUTER_BASE}{path}", headers=_headers(), json=payload)
+        for delay in (*_RETRY_429_DELAYS_S, None):
+            r = await c.post(f"{config.OPENROUTER_BASE}{path}", headers=_headers(), json=payload)
+            if r.status_code != 429 or delay is None:
+                break
+            wait = _retry_after(r, delay)
+            log.warning("OpenRouter 429 on %s, retrying in %.1fs", path, wait)
+            await asyncio.sleep(wait)
 
     if r.status_code != 200:
         body = r.text[:400]

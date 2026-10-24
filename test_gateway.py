@@ -34,6 +34,10 @@ from app import alerts, claude, config, main, openrouter  # noqa: E402
 from app.main import _Quota, _tier_config, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+# Several embed tests replace openrouter._post without restoring it.
+_REAL_OPENROUTER_POST = openrouter._post
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
 
 def _isolate_alert_globals() -> None:
     """Keep the whole suite off the live state file and off Slack."""
@@ -1576,6 +1580,57 @@ def test_usage_reports_callers_sorted() -> None:
             "available", "last_rate_limit", "calls", "notional_cost_usd", "openrouter_fallbacks",
         }
         assert set(body["openrouter"]) >= {"limit", "usage", "limit_remaining"}
+
+
+def _openrouter_returning(statuses: list[int]):
+    """Swap openrouter's HTTP client for one that answers with these statuses in order."""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = statuses[len(calls)]
+        calls.append(status)
+        return httpx.Response(status, json={"data": [{"index": 0, "embedding": [0.1]}]})
+
+    transport = httpx.MockTransport(handler)
+    openrouter.httpx.AsyncClient = lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+    return calls
+
+
+def test_openrouter_429_is_retried_before_alerting() -> None:
+    sent: list[int] = []
+
+    async def fake_alert(status: int, body: str) -> None:
+        sent.append(status)
+
+    original = openrouter._post, openrouter._RETRY_429_DELAYS_S, alerts.on_openrouter_error
+    openrouter._post = _REAL_OPENROUTER_POST
+    openrouter._RETRY_429_DELAYS_S = (0, 0, 0)
+    alerts.on_openrouter_error = fake_alert
+    try:
+        # A 429 that clears on retry succeeds and stays off Slack.
+        calls = _openrouter_returning([429, 429, 200])
+        assert asyncio.run(openrouter.embed(["a"], 1)) == [[0.1]]
+        assert calls == [429, 429, 200] and sent == []
+
+        # One that survives every retry fails and alerts exactly once.
+        calls = _openrouter_returning([429] * 4)
+        try:
+            asyncio.run(openrouter.embed(["a"], 1))
+            raise AssertionError("expected OpenRouterError")
+        except openrouter.OpenRouterError:
+            pass
+        assert len(calls) == 4 and sent == [429]
+
+        # Other errors are not retried.
+        calls = _openrouter_returning([402])
+        try:
+            asyncio.run(openrouter.embed(["a"], 1))
+        except openrouter.OpenRouterError:
+            pass
+        assert calls == [402]
+    finally:
+        openrouter.httpx.AsyncClient = _REAL_ASYNC_CLIENT
+        openrouter._post, openrouter._RETRY_429_DELAYS_S, alerts.on_openrouter_error = original
 
 
 if __name__ == "__main__":

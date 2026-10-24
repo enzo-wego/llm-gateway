@@ -229,7 +229,14 @@ async def on_openrouter_error(status: int, body: str) -> None:
             "Raise the cap or wait for the monthly reset.",
         )
     elif status == 429:
-        await alert("openrouter:429", "*OpenRouter rate-limited* the embedding calls.", critical=False)
+        await alert(
+            "openrouter:429",
+            "*OpenRouter is still rate-limiting after 3 retries.* That request failed, "
+            "so its embedding or answer was not stored. One of these is noise. If it "
+            "repeats, a caller is sending faster than OpenRouter allows: slow it down "
+            "or batch its texts into fewer `/embed` calls.",
+            critical=False,
+        )
     elif status in (401, 403):
         await alert("openrouter:auth", f"*OpenRouter rejected the key* (HTTP {status}). Embeddings are down.")
     else:
