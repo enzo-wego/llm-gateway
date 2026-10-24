@@ -10,8 +10,10 @@ to "openrouter", or when the seat's quota is spent and FALLBACK_ON_QUOTA is on.
 It reproduces what agent-mem does today.
 """
 
+import asyncio
 import json
 import logging
+import math
 from typing import Any
 
 import httpx
@@ -29,15 +31,39 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {config.OPENROUTER_KEY}", "Content-Type": "application/json"}
 
 
-async def _post(path: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+# A 429 is a momentary rate limit that usually clears within seconds, so
+# embeddings retry it rather than fail back to the caller. Only /embeddings
+# retries: generate and describe already run at CLAUDE_TIMEOUT_S (180 s), and
+# up to 30 s of sleeps on top would pass agent-mem's 200 s client timeout.
+_RETRY_429_DELAYS_S = (1, 2, 4)
+_RETRY_AFTER_CAP_S = 10
+
+
+def _retry_after(r: httpx.Response, default: float) -> float:
+    try:
+        v = float(r.headers["Retry-After"])
+    except (KeyError, ValueError):
+        return default
+    return max(0.0, min(v, _RETRY_AFTER_CAP_S)) if math.isfinite(v) else default
+
+
+async def _post(path: str, payload: dict[str, Any], timeout: int, retry_429: bool = False) -> dict[str, Any]:
+    delays = _RETRY_429_DELAYS_S if retry_429 else ()
     async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.post(f"{config.OPENROUTER_BASE}{path}", headers=_headers(), json=payload)
+        for delay in (*delays, None):
+            r = await c.post(f"{config.OPENROUTER_BASE}{path}", headers=_headers(), json=payload)
+            if r.status_code != 429 or delay is None:
+                break
+            wait = _retry_after(r, delay)
+            log.warning("OpenRouter 429 on %s, retrying in %.1fs", path, wait)
+            await asyncio.sleep(wait)
 
     if r.status_code != 200:
         body = r.text[:400]
+        log.warning("OpenRouter %s on %s, giving up", r.status_code, path)
         # 402 means the monthly cap is spent, which stops embedding writes and
         # therefore stops the graph growing. That has to reach Slack.
-        await alerts.on_openrouter_error(r.status_code, body)
+        await alerts.on_openrouter_error(r.status_code, body, path)
         raise OpenRouterError(f"OpenRouter {r.status_code}: {body}")
 
     data = r.json()
@@ -151,6 +177,7 @@ async def embed(texts: list[str], dims: int) -> list[list[float]]:
             "/embeddings",
             {"model": config.EMBED_MODEL, "input": chunk, "dimensions": dims},
             timeout=120,
+            retry_429=True,
         )
         rows = data.get("data") or []
         if len(rows) != len(chunk):
