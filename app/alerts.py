@@ -219,7 +219,7 @@ async def on_claude_error(err: str) -> None:
         await alert(f"claude-error:{err}", f"Claude returned a terminal error: `{err}`.")
 
 
-async def on_openrouter_error(status: int, body: str) -> None:
+async def on_openrouter_error(status: int, body: str, path: str = "") -> None:
     """Alert on the OpenRouter failures that stop embedding writes."""
     if status == 402:
         await alert(
@@ -229,14 +229,19 @@ async def on_openrouter_error(status: int, body: str) -> None:
             "Raise the cap or wait for the monthly reset.",
         )
     elif status == 429:
-        await alert(
-            "openrouter:429",
-            "*OpenRouter is still rate-limiting after 3 retries.* That request failed, "
-            "so its embedding or answer was not stored. One of these is noise. If it "
-            "repeats, a caller is sending faster than OpenRouter allows: slow it down "
-            "or batch its texts into fewer `/embed` calls.",
-            critical=False,
-        )
+        # Repeats inside the dedupe window never reach Slack, so point at the
+        # log lines that do show them.
+        repeats = ("A single one is noise. To see repeats (this alert is deduped), run "
+                   "`docker compose logs --since 1h llm-gateway | grep 'OpenRouter 429'`.")
+        if path == "/embeddings":
+            text = ("*OpenRouter still rate-limited `/embeddings` after retries.* That call "
+                    "failed, so its vector was not stored. " + repeats + " Many lines mean "
+                    "a caller is embedding too fast: slow it down or batch texts into fewer "
+                    "`/embed` calls.")
+        else:
+            text = (f"*OpenRouter rate-limited `{path or 'a request'}`.* That call failed "
+                    "with 502 (not retried). " + repeats)
+        await alert("openrouter:429", text, critical=False)
     elif status in (401, 403):
         await alert("openrouter:auth", f"*OpenRouter rejected the key* (HTTP {status}). Embeddings are down.")
     else:

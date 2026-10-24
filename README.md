@@ -131,7 +131,7 @@ to Slack (deduped per window):
 | `status == "allowed_warning"` and utilization ≥ `LLM_GATEWAY_QUOTA_WARN_PCT` (95) | Approaching the cap |
 | `AssistantMessage.error == "authentication_failed"` | CLI login expired |
 | OpenRouter `402` | Embedding budget gone — the graph has stopped growing |
-| OpenRouter `429` after 3 retries (1 s, 2 s, 4 s, or `Retry-After` capped at 10 s) | That request failed; a single one is noise, repeats mean a caller is sending too fast |
+| OpenRouter `429`: on `/embeddings` after 3 retries (1 s, 2 s, 4 s, or `Retry-After` capped at 10 s); generate and describe do not retry | That call failed. One is noise; many `OpenRouter 429` log lines mean a caller is sending too fast |
 
 Seat quotas are per-window and per-family: `five_hour`, `seven_day`,
 `seven_day_opus`, `seven_day_sonnet`, `overage`. The alert names which tripped.

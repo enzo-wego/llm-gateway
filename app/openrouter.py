@@ -13,6 +13,7 @@ It reproduces what agent-mem does today.
 import asyncio
 import json
 import logging
+import math
 from typing import Any
 
 import httpx
@@ -30,23 +31,26 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {config.OPENROUTER_KEY}", "Content-Type": "application/json"}
 
 
-# A 429 is a momentary rate limit that usually clears within seconds, so it is
-# retried rather than failed back to the caller. Only a 429 that survives every
-# retry reaches Slack.
+# A 429 is a momentary rate limit that usually clears within seconds, so
+# embeddings retry it rather than fail back to the caller. Only /embeddings
+# retries: generate and describe already run at CLAUDE_TIMEOUT_S (180 s), and
+# up to 30 s of sleeps on top would pass agent-mem's 200 s client timeout.
 _RETRY_429_DELAYS_S = (1, 2, 4)
 _RETRY_AFTER_CAP_S = 10
 
 
 def _retry_after(r: httpx.Response, default: float) -> float:
     try:
-        return min(float(r.headers["Retry-After"]), _RETRY_AFTER_CAP_S)
+        v = float(r.headers["Retry-After"])
     except (KeyError, ValueError):
         return default
+    return max(0.0, min(v, _RETRY_AFTER_CAP_S)) if math.isfinite(v) else default
 
 
-async def _post(path: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+async def _post(path: str, payload: dict[str, Any], timeout: int, retry_429: bool = False) -> dict[str, Any]:
+    delays = _RETRY_429_DELAYS_S if retry_429 else ()
     async with httpx.AsyncClient(timeout=timeout) as c:
-        for delay in (*_RETRY_429_DELAYS_S, None):
+        for delay in (*delays, None):
             r = await c.post(f"{config.OPENROUTER_BASE}{path}", headers=_headers(), json=payload)
             if r.status_code != 429 or delay is None:
                 break
@@ -58,7 +62,7 @@ async def _post(path: str, payload: dict[str, Any], timeout: int) -> dict[str, A
         body = r.text[:400]
         # 402 means the monthly cap is spent, which stops embedding writes and
         # therefore stops the graph growing. That has to reach Slack.
-        await alerts.on_openrouter_error(r.status_code, body)
+        await alerts.on_openrouter_error(r.status_code, body, path)
         raise OpenRouterError(f"OpenRouter {r.status_code}: {body}")
 
     data = r.json()
@@ -172,6 +176,7 @@ async def embed(texts: list[str], dims: int) -> list[list[float]]:
             "/embeddings",
             {"model": config.EMBED_MODEL, "input": chunk, "dimensions": dims},
             timeout=120,
+            retry_429=True,
         )
         rows = data.get("data") or []
         if len(rows) != len(chunk):

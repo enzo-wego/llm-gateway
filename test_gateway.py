@@ -116,7 +116,7 @@ def test_embed_reorders_by_index() -> None:
     """A response whose rows arrive shuffled must still come back in input order."""
     captured: dict = {}
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         captured["inputs"] = payload["input"]
         # Deliberately out of order, each row tagged with its true index.
         return {"data": [
@@ -133,7 +133,7 @@ def test_embed_reorders_by_index() -> None:
 
 def test_embed_rejects_bad_index() -> None:
     """An out-of-range index must raise, never silently drop or misplace a row."""
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         return {"data": [{"index": 7, "embedding": [1.0]}]}
 
     openrouter._post = fake_post
@@ -146,7 +146,7 @@ def test_embed_rejects_bad_index() -> None:
 
 def test_embed_rejects_count_mismatch() -> None:
     """Fewer vectors than inputs must raise rather than return a short list."""
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         return {"data": [{"index": 0, "embedding": [1.0]}]}
 
     openrouter._post = fake_post
@@ -161,7 +161,7 @@ def test_embed_chunks_large_batches() -> None:
     """Inputs beyond the per-call cap are split, and order survives the split."""
     calls: list[int] = []
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         n = len(payload["input"])
         calls.append(n)
         base = sum(calls[:-1])
@@ -310,7 +310,7 @@ def test_openrouter_generate_honours_schema_and_returns_output() -> None:
     captured: dict = {}
     original = openrouter._post
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         captured["payload"] = payload
         return {"choices": [{"message": {"content": '{"code":"13.1"}'}}], "usage": {}}
 
@@ -338,7 +338,7 @@ def test_openrouter_generate_max_tokens_is_configurable() -> None:
     original = openrouter._post
     old = config.OR_MAX_TOKENS
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         captured["max_tokens"] = payload["max_tokens"]
         return {"choices": [{"message": {"content": "{}"}}]}
 
@@ -366,7 +366,7 @@ def test_describe_sends_pdfs_as_documents_and_images_as_images() -> None:
     sent: list = []
     original_post, original_guarded = openrouter._post, claude._guarded
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         sent.append(payload["messages"][0]["content"][1])
         return {"choices": [{"message": {"content": "ok"}}]}
 
@@ -400,7 +400,7 @@ def test_openrouter_describe_max_tokens_is_configurable() -> None:
     original = openrouter._post
     old = config.OR_MAX_TOKENS_DESCRIBE
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         captured["max_tokens"] = payload["max_tokens"]
         return {"choices": [{"message": {"content": "{}"}}]}
 
@@ -1599,7 +1599,7 @@ def _openrouter_returning(statuses: list[int]):
 def test_openrouter_429_is_retried_before_alerting() -> None:
     sent: list[int] = []
 
-    async def fake_alert(status: int, body: str) -> None:
+    async def fake_alert(status: int, body: str, path: str = "") -> None:
         sent.append(status)
 
     original = openrouter._post, openrouter._RETRY_429_DELAYS_S, alerts.on_openrouter_error
@@ -1628,10 +1628,33 @@ def test_openrouter_429_is_retried_before_alerting() -> None:
         except openrouter.OpenRouterError:
             pass
         assert calls == [402]
+
+        # Generate does not retry: its 180 s timeout leaves no room under the
+        # caller's 200 s.
+        calls = _openrouter_returning([429, 200])
+        try:
+            asyncio.run(openrouter.generate(system="", user="u", model="m"))
+            raise AssertionError("expected OpenRouterError")
+        except openrouter.OpenRouterError:
+            pass
+        assert calls == [429]
     finally:
         openrouter.httpx.AsyncClient = _REAL_ASYNC_CLIENT
         openrouter._post, openrouter._RETRY_429_DELAYS_S, alerts.on_openrouter_error = original
 
+
+
+def test_retry_after_is_capped_and_ignores_garbage() -> None:
+    def r(value: str) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": value})
+
+    assert openrouter._retry_after(r("999"), 1) == openrouter._RETRY_AFTER_CAP_S
+    assert openrouter._retry_after(r("3"), 1) == 3
+    assert openrouter._retry_after(r("-5"), 1) == 0
+    # NaN would crash asyncio.sleep into a 500 that skips the alert.
+    assert openrouter._retry_after(r("nan"), 1) == 1
+    assert openrouter._retry_after(r("soon"), 2) == 2
+    assert openrouter._retry_after(httpx.Response(429), 4) == 4
 
 if __name__ == "__main__":
     os.environ["ANTHROPIC_API_KEY"] = "sk-ant-should-be-stripped"
