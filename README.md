@@ -39,7 +39,7 @@ All routes except `/health` require `X-API-Key`.
 |---|---|---|
 | `POST /generate` | seat or OpenRouter | `{system, user, tier: "summary"\|"cheap", schema?}` |
 | `POST /describe` | seat or OpenRouter | `{system, prompt, mime, data_b64, schema?}` |
-| `POST /embed` | OpenRouter, then Gemini on cap exhaustion | `{texts: [...], dims}` |
+| `POST /embed` | OpenRouter, then Gemini on cap exhaustion | `{texts: [...], dims, fallback?}` (`fallback` defaults to `true`; `false` disables Gemini fallback for that request) |
 | `GET /config` | — | current editable, non-secret runtime configuration |
 | `PUT /config` | — | partial configuration update, applied live and persisted to `.env` |
 | `GET /health` | — | quota state, counters, active backends |

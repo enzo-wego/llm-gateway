@@ -1699,6 +1699,60 @@ def test_embed_falls_back_for_cap_statuses_and_full_403_body() -> None:
             assert _summaries(records, "embed")[0].endswith("backend=gemini")
 
 
+def test_embed_fallback_false_returns_openrouter_cap_error() -> None:
+    with gemini_fallback_env(), captured_gateway_logs() as records:
+        called = False
+
+        async def fail(texts, dims):
+            raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+        async def forbidden(texts, dims):
+            nonlocal called
+            called = True
+            return []
+
+        openrouter.embed = fail
+        gemini.embed = forbidden
+        response = _post(
+            "/embed",
+            {"texts": ["a"], "fallback": False},
+            "optout",
+        )
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == "OpenRouter 402: spent"
+        assert not called
+        summary = _summaries(records, "embed")[0]
+        assert "reason=openrouter_error" in summary
+        assert summary.endswith("backend=openrouter")
+
+
+def test_embed_fallback_false_keeps_openrouter_success() -> None:
+    with gemini_fallback_env(), captured_gateway_logs() as records:
+        called = False
+
+        async def primary(texts, dims):
+            return [[1.0]]
+
+        async def forbidden(texts, dims):
+            nonlocal called
+            called = True
+            return []
+
+        openrouter.embed = primary
+        gemini.embed = forbidden
+        response = _post(
+            "/embed",
+            {"texts": ["a"], "dims": 1, "fallback": False},
+            "optout",
+        )
+
+        assert response.status_code == 200
+        assert response.json()["embeddings"] == [[1.0]]
+        assert not called
+        assert _summaries(records, "embed")[0].endswith("backend=openrouter")
+
+
 def test_embed_does_not_fallback_for_auth_errors_or_openrouter_success() -> None:
     for err in (
         openrouter.OpenRouterError("OpenRouter 401", status=401),

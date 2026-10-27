@@ -141,6 +141,7 @@ class EmbedIn(BaseModel):
     # OpenRouter answers 400 to an empty string, which would page as an alert.
     texts: list[Annotated[str, Field(min_length=1)]]
     dims: int = 3072
+    fallback: bool = True
 
 
 def _tier_config(tier: Tier) -> tuple[str, str, str, str, str]:
@@ -307,7 +308,7 @@ async def embed(body: EmbedIn, caller: str = Depends(caller_label)) -> dict[str,
         try:
             vectors = await openrouter.embed(body.texts, body.dims)
         except openrouter.OpenRouterError as e:
-            if not e.cap or not config.GEMINI_API_KEY:
+            if not e.cap or not config.GEMINI_API_KEY or not body.fallback:
                 reason = "openrouter_error"
                 status = 502
                 raise HTTPException(502, str(e)) from e
