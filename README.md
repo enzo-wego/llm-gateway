@@ -1,13 +1,14 @@
 # llm-gateway
 
-One HTTP surface in front of two LLM backends, so callers ask for an *intent*
+One HTTP surface in front of three LLM backends, so callers ask for an *intent*
 and this service decides which model and provider serves it.
 
 Built for `agent-mem`, but nothing in here is agent-mem-specific.
 
 ```
 caller ──HTTP──▶ llm-gateway ──▶ Claude (subscription seat, via bundled CLI)
-                             └──▶ OpenRouter (embeddings, and fallback generation)
+                             ├──▶ OpenRouter (primary embeddings, fallback generation)
+                             └──▶ Gemini API (embeddings when OpenRouter's cap is spent)
 ```
 
 ## Why two backends
@@ -38,7 +39,7 @@ All routes except `/health` require `X-API-Key`.
 |---|---|---|
 | `POST /generate` | seat or OpenRouter | `{system, user, tier: "summary"\|"cheap", schema?}` |
 | `POST /describe` | seat or OpenRouter | `{system, prompt, mime, data_b64, schema?}` |
-| `POST /embed` | OpenRouter always | `{texts: [...], dims}` |
+| `POST /embed` | OpenRouter, then Gemini on cap exhaustion | `{texts: [...], dims}` |
 | `GET /config` | — | current editable, non-secret runtime configuration |
 | `PUT /config` | — | partial configuration update, applied live and persisted to `.env` |
 | `GET /health` | — | quota state, counters, active backends |
@@ -112,9 +113,11 @@ must remain below agent-mem's 200-second client timeout.
 | `LLM_GATEWAY_BACKEND_CHEAP` | `claude` · `openrouter` | `claude` |
 | `LLM_GATEWAY_BACKEND_DESCRIBE` | `claude` · `openrouter` | `claude` |
 | `LLM_GATEWAY_FALLBACK_ON_QUOTA` | `true` · `false` | `true` |
+| `GEMINI_API_KEY` | Gemini API credential (secret, restart required) | unset |
 
 Setting a route to `openrouter` reproduces agent-mem's pre-gateway behaviour
-exactly. Embeddings have no switch — there is no alternative provider.
+exactly. Embeddings have no switch: OpenRouter remains primary, and the direct
+Gemini API is used only when OpenRouter reports that its monthly cap is spent.
 
 With `FALLBACK_ON_QUOTA=true`, exhausting the seat's window degrades that route
 to OpenRouter for the rest of the window instead of failing, and still fires the
@@ -130,7 +133,8 @@ to Slack (deduped per window):
 | `RateLimitInfo.status == "rejected"` | Seat quota spent |
 | `status == "allowed_warning"` and utilization ≥ `LLM_GATEWAY_QUOTA_WARN_PCT` (95) | Approaching the cap |
 | `AssistantMessage.error == "authentication_failed"` | CLI login expired |
-| OpenRouter `402` | Embedding budget gone — the graph has stopped growing |
+| OpenRouter `402`, or `403` containing `Key limit exceeded` | Monthly embedding cap spent; embeddings retry directly through Gemini when `GEMINI_API_KEY` is set |
+| Gemini embedding fallback error | Both embedding providers failed; embeddings are not being stored |
 | OpenRouter `429`: on `/embeddings` after 3 retries (1 s, 2 s, 4 s, or `Retry-After` capped at 10 s); generate and describe do not retry | That call failed. One is noise; many `OpenRouter 429` log lines mean a caller is sending too fast |
 
 Seat quotas are per-window and per-family: `five_hour`, `seven_day`,

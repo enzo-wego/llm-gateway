@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import time
 
@@ -219,14 +220,45 @@ async def on_claude_error(err: str) -> None:
         await alert(f"claude-error:{err}", f"Claude returned a terminal error: `{err}`.")
 
 
-async def on_openrouter_error(status: int, body: str, path: str = "") -> None:
+def is_cap_error(status: int, text: str) -> bool:
+    """Return whether OpenRouter says the configured monthly cap is spent."""
+    return status == 402 or (status == 403 and "Key limit exceeded" in text)
+
+
+def _cap_reset(body: str) -> str | None:
+    match = re.search(
+        r"\bresets\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\b",
+        body,
+    )
+    return match.group(1) if match else None
+
+
+async def on_gemini_error(msg: str) -> None:
+    """Alert when the direct embedding fallback also fails."""
+    await alert(
+        "gemini:embed",
+        f"*Gemini embedding fallback failed.* Embeddings are failing: `{msg[:200]}`",
+    )
+
+
+async def on_openrouter_error(
+    status: int, body: str, path: str = "", cap: bool = False
+) -> None:
     """Alert on the OpenRouter failures that stop embedding writes."""
-    if status == 402:
+    if cap:
+        reset = _cap_reset(body)
+        figure = re.search(r"\bof\s+(\$\d+(?:\.\d+)?)\s+used\b", body)
+        amount = figure.group(1) if figure else "$50"
+        retry = (
+            " Embeddings will be retried on the Gemini API directly."
+            if config.GEMINI_API_KEY
+            else " Embeddings are failing: set GEMINI_API_KEY or raise the cap."
+        )
         await alert(
             "openrouter:402",
-            "*OpenRouter is out of credit* — the $50 monthly cap is spent. "
-            "Embeddings are failing, so the graph has stopped growing. "
-            "Raise the cap or wait for the monthly reset.",
+            f"*OpenRouter monthly cap is spent.* The {amount} monthly cap is spent."
+            + (f" resets {reset}." if reset else "")
+            + retry,
         )
     elif status == 429:
         # Repeats inside the dedupe window never reach Slack, so point at the

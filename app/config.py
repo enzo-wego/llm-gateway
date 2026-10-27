@@ -125,12 +125,16 @@ MAX_BUDGET_USD = float(os.getenv("LLM_GATEWAY_MAX_BUDGET_USD", "0.50"))
 # call would otherwise hold a worker slot indefinitely.
 CLAUDE_TIMEOUT_S = _int("LLM_GATEWAY_CLAUDE_TIMEOUT_S", 180)
 
-# ── OpenRouter (embeddings only) ─────────────────────────────────────────────
+# ── OpenRouter primary and Gemini embedding fallback ─────────────────────────
 # Embeddings cannot move to Claude: Anthropic has no embeddings API, and the
 # stored vectors (768 flat / 3072 graph) are all gemini-embedding-001. Keeping
 # the exact model id preserves the vector space, so nothing needs re-embedding.
 OPENROUTER_KEY = _req("OPENROUTER_API_KEY")
 OPENROUTER_BASE = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_BASE = os.getenv(
+    "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"
+)
 EMBED_MODEL = os.getenv("LLM_GATEWAY_EMBED_MODEL", "google/gemini-embedding-001")
 
 # Google's batchEmbedContents rejects >100 per call; 96 stays under that and

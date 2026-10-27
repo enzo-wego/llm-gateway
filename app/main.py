@@ -15,7 +15,7 @@ from typing import Annotated, Any, Literal
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from . import alerts, claude, config, openrouter
+from . import alerts, claude, config, gemini, openrouter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("llm-gateway")
@@ -98,11 +98,11 @@ def _count_call(label: str, status: int | str, cost: float) -> None:
 
 def _summarize(
     fmt: str, caller: str, status: int | str, reason: str,
-    started: float, cost: float, *fields: Any,
+    started: float, cost: float, *fields: Any, tail: tuple[Any, ...] = (),
 ) -> None:
     """Write the one summary record for a handler invocation and update the store.
 
-    Log args are: caller, *fields, status, reason, duration_ms.
+    Log args are: caller, *fields, status, reason, duration_ms, *tail.
     """
     duration_ms = int((time.monotonic() - started) * 1000)
     level = (
@@ -110,7 +110,7 @@ def _summarize(
         if isinstance(status, int) and status >= 500
         else logging.WARNING if reason != "none" else logging.INFO
     )
-    log.log(level, fmt, caller, *fields, status, reason, duration_ms)
+    log.log(level, fmt, caller, *fields, status, reason, duration_ms, *tail)
     _count_call(caller, status, cost)
 
 
@@ -293,20 +293,37 @@ async def describe(body: DescribeIn, caller: str = Depends(caller_label)) -> dic
 
 @app.post("/embed", dependencies=[Depends(require_key)])
 async def embed(body: EmbedIn, caller: str = Depends(caller_label)) -> dict[str, Any]:
-    """Always OpenRouter — see openrouter.py for why there is no switch."""
+    """Embed through OpenRouter, falling back to Gemini only when its cap is spent."""
     started = time.monotonic()
     status: int | str = 500
     reason = "none"
+    backend = "openrouter"
     try:
         if not body.texts:
             status = 200
             return {"embeddings": [], "model": config.EMBED_MODEL}
+        # ponytail: intentionally no "OpenRouter capped" state; every request
+        # tries the primary first so recovery needs no cache invalidation.
         try:
             vectors = await openrouter.embed(body.texts, body.dims)
         except openrouter.OpenRouterError as e:
-            reason = "openrouter_error"
-            status = 502
-            raise HTTPException(502, str(e)) from e
+            if not e.cap or not config.GEMINI_API_KEY:
+                reason = "openrouter_error"
+                status = 502
+                raise HTTPException(502, str(e)) from e
+            backend = "gemini"
+            # ponytail: this best-effort fallback has no request-wide deadline;
+            # retries or multiple chunks can exceed agent-mem's 200 s timeout.
+            try:
+                vectors = await gemini.embed(body.texts, body.dims)
+            except gemini.GeminiError as fallback_error:
+                safe_error = str(fallback_error).replace(config.GEMINI_API_KEY, "[redacted]")
+                await alerts.on_gemini_error(safe_error)
+                reason = "gemini_error"
+                status = 502
+                raise HTTPException(
+                    502, f"{e}; fallback: {safe_error}"
+                ) from fallback_error
         status = 200
         return {"embeddings": vectors, "model": config.EMBED_MODEL, "dims": body.dims}
     except asyncio.CancelledError:
@@ -319,8 +336,8 @@ async def embed(body: EmbedIn, caller: str = Depends(caller_label)) -> dict[str,
         raise
     finally:
         _summarize(
-            "embed caller=%s texts=%d status=%s reason=%s duration_ms=%d",
-            caller, status, reason, started, 0.0, len(body.texts),
+            "embed caller=%s texts=%d status=%s reason=%s duration_ms=%d backend=%s",
+            caller, status, reason, started, 0.0, len(body.texts), tail=(backend,),
         )
 
 
@@ -414,6 +431,7 @@ async def health() -> dict[str, Any]:
             "openrouter_fallbacks": quota.fallbacks,
         },
         "fallback_on_quota": config.FALLBACK_ON_QUOTA,
+        "embed_fallback": "gemini" if config.GEMINI_API_KEY else None,
         "alerts_enabled": config.ALERTS_ENABLED,
     }
 
