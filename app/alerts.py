@@ -12,6 +12,7 @@ persists to ALERT_STATE_FILE so it survives a restart.
 """
 
 import asyncio
+from datetime import datetime
 import json
 import logging
 import math
@@ -247,19 +248,43 @@ async def on_openrouter_error(
     """Alert on the OpenRouter failures that stop embedding writes."""
     if cap:
         reset = _cap_reset(body)
-        figure = re.search(r"\bof\s+(\$\d+(?:\.\d+)?)\s+used\b", body)
-        amount = figure.group(1) if figure else "$50"
-        retry = (
-            " Embeddings will be retried on the Gemini API directly."
-            if config.GEMINI_API_KEY
-            else " Embeddings are failing: set GEMINI_API_KEY or raise the cap."
+        figure = re.search(
+            r"\$(\d+(?:\.\d+)?)\s+of\s+\$(\d+(?:\.\d+)?)\s+used\b",
+            body,
         )
-        await alert(
-            "openrouter:402",
-            f"*OpenRouter monthly cap is spent.* The {amount} monthly cap is spent."
-            + (f" resets {reset}." if reset else "")
-            + retry,
-        )
+        details = []
+        if figure:
+            used, cap_amount = (float(value) for value in figure.groups())
+            details.append(f"${used:.2f} of ${cap_amount:.2f} used")
+        if reset:
+            details.append(f"resets {reset}")
+        text = "*OpenRouter monthly cap is spent*"
+        if details:
+            text += f" ({', '.join(details)})"
+        text += "."
+        if config.GEMINI_API_KEY and path == "/embeddings":
+            until = None
+            if reset:
+                try:
+                    parsed = datetime.fromisoformat(reset.replace("Z", "+00:00")).timestamp()
+                    if parsed > time.time():
+                        until = parsed
+                except ValueError:
+                    pass
+            await alert(
+                "openrouter:cap:fallback",
+                text + " Embeddings will be retried on the Gemini API directly.",
+                critical=False,
+                until=until,
+            )
+        else:
+            failure = (
+                " Embeddings are failing: set GEMINI_API_KEY or raise the cap."
+                if path == "/embeddings"
+                else f" Requests to `{path or 'a request'}` are failing: "
+                     "raise the cap or wait for the reset."
+            )
+            await alert("openrouter:402", text + failure)
     elif status == 429:
         # Repeats inside the dedupe window never reach Slack, so point at the
         # log lines that do show them. [4] keeps the grep from matching this

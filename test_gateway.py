@@ -1813,7 +1813,9 @@ def test_embed_cap_without_key_does_not_fallback_and_alert_explains_recovery() -
     posts: list = []
     with isolated_alerts(posts):
         config.GEMINI_API_KEY = ""
-        asyncio.run(alerts.on_openrouter_error(402, "spent", cap=True))
+        asyncio.run(alerts.on_openrouter_error(
+            402, "spent", path="/embeddings", cap=True
+        ))
         assert "set GEMINI_API_KEY or raise the cap" in posts[0]["text"]
 
 
@@ -1940,18 +1942,108 @@ def test_cap_alert_classification_and_dedupe_key() -> None:
     assert not alerts.is_cap_error(403, "forbidden")
     posts: list = []
     with isolated_alerts(posts) as ctl:
+        reset = 1793491200.0
+        ctl.now = reset - config.ALERT_DEDUPE_S - 10
         config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
         body = '{"message":"$76.25 of $75 used; resets 2026-11-01T00:00:00.000Z.","code":403}'
-        asyncio.run(alerts.on_openrouter_error(402, body, cap=True))
-        asyncio.run(alerts.on_openrouter_error(403, "Key limit exceeded", cap=True))
+        asyncio.run(alerts.on_openrouter_error(402, body, path="/embeddings", cap=True))
+        asyncio.run(alerts.on_openrouter_error(
+            403, "Key limit exceeded", path="/embeddings", cap=True
+        ))
         assert len(posts) == 1
+        assert posts[0]["text"].startswith("⚠️")
         assert "rejected the key" not in posts[0]["text"]
-        assert "$75" in posts[0]["text"] and "$50" not in posts[0]["text"]
+        assert posts[0]["text"].count("cap is spent") == 1
+        assert "$76.25 of $75.00 used" in posts[0]["text"] and "$50" not in posts[0]["text"]
         assert "resets 2026-11-01T00:00:00.000Z" in posts[0]["text"]
         assert "code" not in posts[0]["text"]
         assert "Gemini API directly" in posts[0]["text"]
+        assert _persisted(ctl)["openrouter:cap:fallback"] == reset
         ctl.now += config.ALERT_DEDUPE_S + 1
-        asyncio.run(alerts.on_openrouter_error(403, "Key limit exceeded", cap=True))
+        asyncio.run(alerts.on_openrouter_error(
+            403, "Key limit exceeded", path="/embeddings", cap=True
+        ))
+        assert len(posts) == 1
+        ctl.now = reset + 1
+        asyncio.run(alerts.on_openrouter_error(
+            403, "Key limit exceeded", path="/embeddings", cap=True
+        ))
+        assert len(posts) == 2
+
+
+def test_cap_alert_on_non_embedding_path_stays_critical() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+        asyncio.run(alerts.on_openrouter_error(
+            402,
+            "$50.60 of $50.00 used; resets 2026-11-01T00:00:00.000Z.",
+            path="/chat/completions",
+            cap=True,
+        ))
+        assert posts[0]["text"].startswith("🚨")
+        assert "$50.60 of $50.00 used" in posts[0]["text"]
+        assert "Requests to `/chat/completions` are failing" in posts[0]["text"]
+        assert "Embeddings" not in posts[0]["text"]
+        assert _persisted(ctl)["openrouter:402"] == ctl.now + config.ALERT_DEDUPE_S
+
+
+def test_cap_alert_without_usable_reset_uses_normal_warning_dedupe() -> None:
+    for body in (
+        "Key limit exceeded",
+        "$50.00 of $50 used; resets 1970-01-01T00:00:01Z.",
+        "$50.00 of $50 used; resets 2026-13-01T00:00:00Z.",
+        "$50.00 of $50 used; resets invalid.",
+    ):
+        posts: list = []
+        with isolated_alerts(posts) as ctl:
+            config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+            asyncio.run(alerts.on_openrouter_error(
+                403, body, path="/embeddings", cap=True
+            ))
+            assert posts[0]["text"].startswith("⚠️")
+            assert _persisted(ctl)["openrouter:cap:fallback"] == ctl.now + config.ALERT_DEDUPE_S
+            ctl.now += config.ALERT_DEDUPE_S + 1
+            asyncio.run(alerts.on_openrouter_error(
+                403, body, path="/embeddings", cap=True
+            ))
+            assert len(posts) == 2
+
+
+def test_cap_alert_without_gemini_key_stays_critical() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        config.GEMINI_API_KEY = ""
+        asyncio.run(alerts.on_openrouter_error(
+            402,
+            "$50.00 of $50 used; resets 2026-11-01T00:00:00.000Z.",
+            path="/embeddings",
+            cap=True,
+        ))
+        assert posts[0]["text"].startswith("🚨")
+        assert "set GEMINI_API_KEY or raise the cap" in posts[0]["text"]
+        assert posts[0]["text"].count("cap is spent") == 1
+        assert "rejected the key" not in posts[0]["text"]
+        assert _persisted(ctl)["openrouter:402"] == ctl.now + config.ALERT_DEDUPE_S
+
+
+def test_cap_warning_does_not_mute_critical_after_restart() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        ctl.now = 1793480000.0
+        config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+        asyncio.run(alerts.on_openrouter_error(
+            402,
+            "$50.00 of $50 used; resets 2026-11-01T00:00:00.000Z.",
+            path="/embeddings",
+            cap=True,
+        ))
+        alerts._reset_state()
+        config.GEMINI_API_KEY = ""
+        asyncio.run(alerts.on_openrouter_error(402, "cap spent", cap=True))
+        assert len(posts) == 2
+        assert posts[1]["text"].startswith("🚨")
+        asyncio.run(alerts.on_openrouter_error(402, "cap spent", cap=True))
         assert len(posts) == 2
 
 
