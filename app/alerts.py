@@ -248,17 +248,21 @@ async def on_openrouter_error(
     """Alert on the OpenRouter failures that stop embedding writes."""
     if cap:
         reset = _cap_reset(body)
-        figure = re.search(r"\bof\s+\$(\d+(?:\.\d+)?)\s+used\b", body)
+        figure = re.search(
+            r"\$(\d+(?:\.\d+)?)\s+of\s+\$(\d+(?:\.\d+)?)\s+used\b",
+            body,
+        )
         details = []
         if figure:
-            details.append(f"${float(figure.group(1)):.2f} used")
+            used, cap_amount = (float(value) for value in figure.groups())
+            details.append(f"${used:.2f} of ${cap_amount:.2f} used")
         if reset:
             details.append(f"resets {reset}")
         text = "*OpenRouter monthly cap is spent*"
         if details:
             text += f" ({', '.join(details)})"
         text += "."
-        if config.GEMINI_API_KEY:
+        if config.GEMINI_API_KEY and path == "/embeddings":
             until = None
             if reset:
                 try:
@@ -274,10 +278,13 @@ async def on_openrouter_error(
                 until=until,
             )
         else:
-            await alert(
-                "openrouter:402",
-                text + " Embeddings are failing: set GEMINI_API_KEY or raise the cap.",
+            failure = (
+                " Embeddings are failing: set GEMINI_API_KEY or raise the cap."
+                if path == "/embeddings"
+                else f" Requests to `{path or 'a request'}` are failing: "
+                     "raise the cap or wait for the reset."
             )
+            await alert("openrouter:402", text + failure)
     elif status == 429:
         # Repeats inside the dedupe window never reach Slack, so point at the
         # log lines that do show them. [4] keeps the grep from matching this

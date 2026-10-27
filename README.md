@@ -133,7 +133,7 @@ to Slack (deduped per window):
 | `RateLimitInfo.status == "rejected"` | Seat quota spent |
 | `status == "allowed_warning"` and utilization ≥ `LLM_GATEWAY_QUOTA_WARN_PCT` (95) | Approaching the cap |
 | `AssistantMessage.error == "authentication_failed"` | CLI login expired |
-| OpenRouter `402`, or `403` containing `Key limit exceeded` | Monthly embedding cap spent. With `GEMINI_API_KEY` set, embeddings retry directly through Gemini and the alert is a warning posted once per cap window when OpenRouter supplies a usable reset time and Slack accepts the post; otherwise it repeats every 30 min. Without the key, the alert is critical every 30 min. |
+| OpenRouter `402`, or `403` containing `Key limit exceeded` | Monthly cap spent. On `/embeddings` with `GEMINI_API_KEY` set, embeddings retry directly through Gemini and the alert is a warning posted once per cap window when OpenRouter supplies a usable reset time and Slack accepts the post; otherwise it repeats every 30 min. On every other path, or without the key, the alert is critical every 30 min. |
 | Gemini embedding fallback error | Both embedding providers failed; embeddings are not being stored |
 | OpenRouter `429`: on `/embeddings` after 3 retries (1 s, 2 s, 4 s, or `Retry-After` capped at 10 s); generate and describe do not retry | That call failed. One is noise; many `OpenRouter 429` log lines mean a caller is sending too fast |
 
