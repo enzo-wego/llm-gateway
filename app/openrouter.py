@@ -24,7 +24,10 @@ log = logging.getLogger("llm-gateway.openrouter")
 
 
 class OpenRouterError(RuntimeError):
-    pass
+    def __init__(self, msg: str, status: int | None = None, cap: bool = False) -> None:
+        super().__init__(msg)
+        self.status = status
+        self.cap = cap
 
 
 def _headers() -> dict[str, str]:
@@ -59,12 +62,15 @@ async def _post(path: str, payload: dict[str, Any], timeout: int, retry_429: boo
             await asyncio.sleep(wait)
 
     if r.status_code != 200:
+        cap = alerts.is_cap_error(r.status_code, r.text)
         body = r.text[:400]
         log.warning("OpenRouter %s on %s, giving up", r.status_code, path)
-        # 402 means the monthly cap is spent, which stops embedding writes and
-        # therefore stops the graph growing. That has to reach Slack.
-        await alerts.on_openrouter_error(r.status_code, body, path)
-        raise OpenRouterError(f"OpenRouter {r.status_code}: {body}")
+        await alerts.on_openrouter_error(
+            r.status_code, r.text if cap else body, path, cap=cap
+        )
+        raise OpenRouterError(
+            f"OpenRouter {r.status_code}: {body}", status=r.status_code, cap=cap
+        )
 
     data = r.json()
     if isinstance(data, dict) and data.get("error"):

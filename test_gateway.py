@@ -30,7 +30,7 @@ os.environ.setdefault("LLM_GATEWAY_API_KEY", "test")
 os.environ.setdefault("OPENROUTER_API_KEY", "sk-or-test")
 
 import httpx  # noqa: E402
-from app import alerts, claude, config, main, openrouter  # noqa: E402
+from app import alerts, claude, config, gemini, main, openrouter  # noqa: E402
 from app.main import _Quota, _tier_config, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -1599,7 +1599,7 @@ def _openrouter_returning(statuses: list[int]):
 def test_openrouter_429_is_retried_before_alerting() -> None:
     sent: list[int] = []
 
-    async def fake_alert(status: int, body: str, path: str = "") -> None:
+    async def fake_alert(status: int, body: str, path: str = "", cap: bool = False) -> None:
         sent.append(status)
 
     original = openrouter._post, openrouter._RETRY_429_DELAYS_S, alerts.on_openrouter_error
@@ -1643,6 +1643,305 @@ def test_openrouter_429_is_retried_before_alerting() -> None:
         openrouter._post, openrouter._RETRY_429_DELAYS_S, alerts.on_openrouter_error = original
 
 
+
+
+GEMINI_DUMMY_KEY = "GEMINI-DUMMY-7f3a"
+
+
+@contextmanager
+def gemini_fallback_env():
+    saved = (
+        config.GEMINI_API_KEY, config.EMBED_MAX_BATCH,
+        openrouter.embed, gemini.embed, alerts.on_gemini_error,
+    )
+    config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+    config.EMBED_MAX_BATCH = 96
+    try:
+        yield
+    finally:
+        (
+            config.GEMINI_API_KEY, config.EMBED_MAX_BATCH,
+            openrouter.embed, gemini.embed, alerts.on_gemini_error,
+        ) = saved
+
+
+def test_embed_falls_back_for_cap_statuses_and_full_403_body() -> None:
+    cases = [
+        (402, "spent"),
+        (403, "Key limit exceeded"),
+        (403, "x" * 401 + "Key limit exceeded"),
+    ]
+    for status, body in cases:
+        with gemini_fallback_env(), captured_gateway_logs() as records:
+            original_post = openrouter._post
+            original_client = openrouter.httpx.AsyncClient
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(status, text=body)
+
+            transport = httpx.MockTransport(handler)
+            openrouter._post = _REAL_OPENROUTER_POST
+            openrouter.httpx.AsyncClient = (
+                lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+            )
+
+            async def fallback(texts, dims):
+                return [[float(i)] for i, _ in enumerate(texts)]
+
+            gemini.embed = fallback
+            try:
+                response = _post("/embed", {"texts": ["a", "b"], "dims": 1}, "fallback")
+            finally:
+                openrouter._post = original_post
+                openrouter.httpx.AsyncClient = original_client
+            assert response.status_code == 200
+            assert response.json()["embeddings"] == [[0.0], [1.0]]
+            assert _summaries(records, "embed")[0].endswith("backend=gemini")
+
+
+def test_embed_does_not_fallback_for_auth_errors_or_openrouter_success() -> None:
+    for err in (
+        openrouter.OpenRouterError("OpenRouter 401", status=401),
+        openrouter.OpenRouterError("OpenRouter 403", status=403),
+    ):
+        with gemini_fallback_env():
+            called = False
+
+            async def fail(texts, dims, error=err):
+                raise error
+
+            async def forbidden(texts, dims):
+                nonlocal called
+                called = True
+                return []
+
+            openrouter.embed = fail
+            gemini.embed = forbidden
+            assert _post("/embed", {"texts": ["a"]}, "auth").status_code == 502
+            assert not called
+
+    with gemini_fallback_env(), captured_gateway_logs() as records:
+        called = False
+
+        async def primary(texts, dims):
+            return [[1.0]]
+
+        async def forbidden(texts, dims):
+            nonlocal called
+            called = True
+            return []
+
+        openrouter.embed = primary
+        gemini.embed = forbidden
+        assert _post("/embed", {"texts": ["a"], "dims": 1}, "primary").status_code == 200
+        assert not called
+        assert _summaries(records, "embed")[0].endswith("backend=openrouter")
+
+
+def test_embed_cap_without_key_does_not_fallback_and_alert_explains_recovery() -> None:
+    with gemini_fallback_env():
+        config.GEMINI_API_KEY = ""
+        called = False
+
+        async def fail(texts, dims):
+            raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+        async def forbidden(texts, dims):
+            nonlocal called
+            called = True
+            return []
+
+        openrouter.embed = fail
+        gemini.embed = forbidden
+        assert _post("/embed", {"texts": ["a"]}, "no-key").status_code == 502
+        assert not called
+
+    posts: list = []
+    with isolated_alerts(posts):
+        config.GEMINI_API_KEY = ""
+        asyncio.run(alerts.on_openrouter_error(402, "spent", cap=True))
+        assert "set GEMINI_API_KEY or raise the cap" in posts[0]["text"]
+
+
+def test_gemini_request_shape_chunking_and_order() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        body = json.loads(request.content)
+        start = sum(len(json.loads(c.content)["requests"]) for c in calls[:-1])
+        return httpx.Response(200, json={"embeddings": [
+            {"values": [float(start + i)]} for i in range(len(body["requests"]))
+        ]})
+
+    original = gemini.httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    gemini.httpx.AsyncClient = lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+    saved = config.GEMINI_API_KEY, config.EMBED_MAX_BATCH
+    config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+    config.EMBED_MAX_BATCH = 500
+    try:
+        got = asyncio.run(gemini.embed([f"t{i}" for i in range(200)], 1))
+        assert got == [[float(i)] for i in range(200)]
+        assert [len(json.loads(c.content)["requests"]) for c in calls] == [96, 96, 8]
+        for call in calls:
+            body = json.loads(call.content)
+            assert call.headers["x-goog-api-key"] == GEMINI_DUMMY_KEY
+            assert GEMINI_DUMMY_KEY not in call.url.query.decode()
+            assert all("taskType" not in r and r["outputDimensionality"] == 1 for r in body["requests"])
+    finally:
+        gemini.httpx.AsyncClient = original
+        config.GEMINI_API_KEY, config.EMBED_MAX_BATCH = saved
+
+
+def test_gemini_failures_include_both_errors_and_alert_once() -> None:
+    failures = [
+        httpx.Response(500, text="bad"),
+        httpx.ConnectTimeout("slow"),
+        httpx.Response(200, text="{"),
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"embeddings": []}),
+        httpx.Response(200, json={"embeddings": [{"values": []}]}),
+    ]
+    for failure in failures:
+        alerted: list[str] = []
+        with gemini_fallback_env():
+            original_client = gemini.httpx.AsyncClient
+
+            async def primary(texts, dims):
+                raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+            def handler(request: httpx.Request, value=failure) -> httpx.Response:
+                if isinstance(value, Exception):
+                    raise value
+                return value
+
+            transport = httpx.MockTransport(handler)
+            gemini.httpx.AsyncClient = (
+                lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+            )
+
+            async def capture(msg):
+                alerted.append(msg)
+
+            openrouter.embed = primary
+            gemini.embed = __import__("app.gemini", fromlist=["embed"]).embed
+            alerts.on_gemini_error = capture
+            try:
+                response = _post("/embed", {"texts": ["a"], "dims": 1}, "failure")
+            finally:
+                gemini.httpx.AsyncClient = original_client
+            assert response.status_code == 502
+            assert "OpenRouter 402" in response.json()["detail"]
+            assert "fallback: Gemini" in response.json()["detail"]
+            assert len(alerted) == 1
+
+
+def test_gemini_secret_boundary() -> None:
+    requests: list[httpx.Request] = []
+    with gemini_fallback_env(), captured_gateway_logs() as records:
+        original_client = gemini.httpx.AsyncClient
+
+        async def primary(texts, dims):
+            raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(500, text=f"echoed {GEMINI_DUMMY_KEY}")
+
+        transport = httpx.MockTransport(handler)
+        gemini.httpx.AsyncClient = (
+            lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+        )
+        alerted: list[str] = []
+
+        async def capture(msg):
+            alerted.append(msg)
+
+        openrouter.embed = primary
+        alerts.on_gemini_error = capture
+        try:
+            response = _post("/embed", {"texts": ["a"], "dims": 1}, "secret")
+        finally:
+            gemini.httpx.AsyncClient = original_client
+        assert response.status_code == 502
+        assert requests[0].headers["x-goog-api-key"] == GEMINI_DUMMY_KEY
+        assert GEMINI_DUMMY_KEY not in response.text
+        assert GEMINI_DUMMY_KEY not in "".join(r.getMessage() for r in records)
+        assert GEMINI_DUMMY_KEY not in "".join(alerted)
+        health = TestClient(app).get("/health").text
+        get_config = TestClient(app).get("/config", headers={"X-API-Key": config.API_KEY}).text
+        assert GEMINI_DUMMY_KEY not in health + get_config
+        rejected = TestClient(app).put(
+            "/config", headers={"X-API-Key": config.API_KEY},
+            json={"GEMINI_API_KEY": GEMINI_DUMMY_KEY},
+        )
+        assert rejected.status_code == 400
+
+
+def test_cap_alert_classification_and_dedupe_key() -> None:
+    assert alerts.is_cap_error(402, "anything")
+    assert alerts.is_cap_error(403, "x" * 401 + "Key limit exceeded")
+    assert not alerts.is_cap_error(401, "Key limit exceeded")
+    assert not alerts.is_cap_error(403, "forbidden")
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+        body = '{"message":"$76.25 of $75 used; resets 2026-11-01T00:00:00.000Z.","code":403}'
+        asyncio.run(alerts.on_openrouter_error(402, body, cap=True))
+        asyncio.run(alerts.on_openrouter_error(403, "Key limit exceeded", cap=True))
+        assert len(posts) == 1
+        assert "rejected the key" not in posts[0]["text"]
+        assert "$75" in posts[0]["text"] and "$50" not in posts[0]["text"]
+        assert "resets 2026-11-01T00:00:00.000Z" in posts[0]["text"]
+        assert "code" not in posts[0]["text"]
+        assert "Gemini API directly" in posts[0]["text"]
+        ctl.now += config.ALERT_DEDUPE_S + 1
+        asyncio.run(alerts.on_openrouter_error(403, "Key limit exceeded", cap=True))
+        assert len(posts) == 2
+
+
+def test_embed_late_chunk_cap_replays_whole_request_on_gemini() -> None:
+    with gemini_fallback_env():
+        seen: list[list[str]] = []
+        openrouter_calls = 0
+        original_post = openrouter._post
+
+        async def post(path, payload, timeout, **kwargs):
+            nonlocal openrouter_calls
+            openrouter_calls += 1
+            if openrouter_calls == 1:
+                return {"data": [
+                    {"index": i, "embedding": [-1.0]} for i in range(len(payload["input"]))
+                ]}
+            raise openrouter.OpenRouterError("late cap", status=402, cap=True)
+
+        async def fallback(texts, dims):
+            seen.append(list(texts))
+            return [[float(i)] for i in range(len(texts))]
+
+        openrouter._post = post
+        openrouter.embed = __import__("app.openrouter", fromlist=["embed"]).embed
+        gemini.embed = fallback
+        texts = [f"t{i}" for i in range(100)]
+        try:
+            response = _post("/embed", {"texts": texts, "dims": 1}, "late")
+        finally:
+            openrouter._post = original_post
+        assert openrouter_calls == 2
+        assert response.json()["embeddings"] == [[float(i)] for i in range(100)]
+        assert seen == [texts]
+
+
+def test_gemini_alert_dedupes_inside_window() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        asyncio.run(alerts.on_gemini_error("first"))
+        ctl.now += config.ALERT_DEDUPE_S - 1
+        asyncio.run(alerts.on_gemini_error("second"))
+        ctl.now += 2
+        asyncio.run(alerts.on_gemini_error("third"))
+        assert len(posts) == 2
 
 def test_retry_after_is_capped_and_ignores_garbage() -> None:
     def r(value: str) -> httpx.Response:
