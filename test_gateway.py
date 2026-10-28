@@ -86,6 +86,26 @@ def captured_gateway_logs():
         main.log.setLevel(original_level)
 
 
+@contextmanager
+def captured_gemini_logs():
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = Capture()
+    logger = logging.getLogger("llm-gateway.gemini")
+    original_level = logger.level
+    logger.setLevel(logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(original_level)
+
+
 def test_claude_unwraps_entire_fenced_block() -> None:
     cases = [
         ("fenced JSON", '```json\n{"ok":true}\n```', '{"ok":true}'),
@@ -1665,6 +1685,48 @@ def gemini_fallback_env():
         ) = saved
 
 
+@contextmanager
+def gemini_transport(responses):
+    calls: list[httpx.Request] = []
+    sleeps: list[float] = []
+    original_client = gemini.httpx.AsyncClient
+    original_sleep = asyncio.sleep
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        value = responses[len(calls) - 1]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    transport = httpx.MockTransport(handler)
+    gemini.httpx.AsyncClient = lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+    asyncio.sleep = record_sleep
+    try:
+        yield calls, sleeps
+    finally:
+        gemini.httpx.AsyncClient = original_client
+        asyncio.sleep = original_sleep
+
+
+@contextmanager
+def recorded_sleeps():
+    sleeps: list[float] = []
+    original_sleep = asyncio.sleep
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    asyncio.sleep = record_sleep
+    try:
+        yield sleeps
+    finally:
+        asyncio.sleep = original_sleep
+
+
 def test_embed_falls_back_for_cap_statuses_and_full_403_body() -> None:
     cases = [
         (402, "spent"),
@@ -1697,6 +1759,62 @@ def test_embed_falls_back_for_cap_statuses_and_full_403_body() -> None:
             assert response.status_code == 200
             assert response.json()["embeddings"] == [[0.0], [1.0]]
             assert _summaries(records, "embed")[0].endswith("backend=gemini")
+
+
+def test_embed_gemini_retry_recovers_without_alerting() -> None:
+    alerted: list[str] = []
+    with gemini_fallback_env(), captured_gateway_logs() as records:
+        async def primary(texts, dims):
+            raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+        async def capture(message: str) -> None:
+            alerted.append(message)
+
+        openrouter.embed = primary
+        gemini.embed = __import__("app.gemini", fromlist=["embed"]).embed
+        alerts.on_gemini_error = capture
+        with gemini_transport([httpx.Response(503, text="temporary"), _gemini_ok([1.0])]) as (
+            calls,
+            sleeps,
+        ):
+            response = _post("/embed", {"texts": ["a"], "dims": 1}, "retry")
+
+        assert response.status_code == 200
+        assert response.json()["embeddings"] == [[1.0]]
+        assert len(calls) == 2
+        assert [delay for delay in sleeps if delay] == [1]
+        assert alerted == []
+        summary = _summaries(records, "embed")[0]
+        assert "status=200" in summary
+        assert summary.endswith("backend=gemini")
+
+
+def test_embed_gemini_retry_exhaustion_alerts_once() -> None:
+    alerted: list[str] = []
+    with gemini_fallback_env(), captured_gateway_logs() as records:
+        async def primary(texts, dims):
+            raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+        async def capture(message: str) -> None:
+            alerted.append(message)
+
+        openrouter.embed = primary
+        gemini.embed = __import__("app.gemini", fromlist=["embed"]).embed
+        alerts.on_gemini_error = capture
+        responses = [httpx.Response(503, text="temporary")] * 4
+        with gemini_transport(responses) as (calls, sleeps):
+            response = _post("/embed", {"texts": ["a"], "dims": 1}, "retry")
+
+        assert response.status_code == 502
+        detail = response.json()["detail"]
+        assert "OpenRouter 402: spent" in detail
+        assert "fallback: Gemini 503: temporary" in detail
+        assert len(calls) == 4
+        assert [delay for delay in sleeps if delay] == [1, 2, 4]
+        assert len(alerted) == 1
+        summary = _summaries(records, "embed")[0]
+        assert "reason=gemini_error" in summary
+        assert "status=502" in summary
 
 
 def test_embed_fallback_false_returns_openrouter_cap_error() -> None:
@@ -1819,6 +1937,179 @@ def test_embed_cap_without_key_does_not_fallback_and_alert_explains_recovery() -
         assert "set GEMINI_API_KEY or raise the cap" in posts[0]["text"]
 
 
+def _gemini_ok(values=None) -> httpx.Response:
+    return httpx.Response(200, json={"embeddings": [{"values": values or [0.1]}]})
+
+
+def _retry_warnings(records: list[logging.LogRecord]) -> list[str]:
+    return [
+        record.getMessage() for record in records
+        if record.levelno == logging.WARNING and "retrying in" in record.getMessage()
+    ]
+
+
+def test_gemini_retryable_statuses_recover_and_exhaust() -> None:
+    for status in (429, 500, 502, 503, 504):
+        with gemini_fallback_env(), captured_gemini_logs() as records:
+            responses = [httpx.Response(status, text="temporary"), _gemini_ok()]
+            with gemini_transport(responses) as (calls, sleeps):
+                assert asyncio.run(gemini.embed(["a"], 1)) == [[0.1]]
+            assert len(calls) == 2
+            assert sleeps == [1]
+            warnings = _retry_warnings(records)
+            assert len(warnings) == 1
+            assert warnings[0] == f"Gemini {status} on embed, retrying in 1.0s"
+
+        with gemini_fallback_env(), captured_gemini_logs() as records:
+            with gemini_transport([httpx.Response(status, text="temporary")] * 4) as (calls, sleeps):
+                try:
+                    asyncio.run(gemini.embed(["a"], 1))
+                    raise AssertionError("expected GeminiError")
+                except gemini.GeminiError as exc:
+                    assert str(exc).startswith(f"Gemini {status}:")
+            assert len(calls) == 4
+            assert sleeps == [1, 2, 4]
+            assert len(_retry_warnings(records)) == 3
+
+
+def test_gemini_retry_after_contract() -> None:
+    cases = [
+        (429, "3", 3),
+        (503, "3", 3),
+        (429, "99", 10),
+        (500, "3", 1),
+    ]
+    for status, retry_after, expected in cases:
+        responses = [
+            httpx.Response(status, headers={"Retry-After": retry_after}),
+            _gemini_ok(),
+        ]
+        with gemini_fallback_env(), captured_gemini_logs() as records:
+            with gemini_transport(responses) as (calls, sleeps):
+                assert asyncio.run(gemini.embed(["a"], 1)) == [[0.1]]
+            assert len(calls) == 2
+            assert sleeps == [expected]
+            assert len(_retry_warnings(records)) == 1
+
+
+def test_gemini_transport_and_mixed_failures_share_retry_budget() -> None:
+    for failure in (httpx.ConnectError("down"), httpx.ReadTimeout("slow")):
+        with gemini_fallback_env(), captured_gemini_logs() as records:
+            with gemini_transport([failure, _gemini_ok()]) as (calls, sleeps):
+                assert asyncio.run(gemini.embed(["a"], 1)) == [[0.1]]
+            assert len(calls) == 2
+            assert sleeps == [1]
+            assert _retry_warnings(records) == [
+                f"Gemini transport error {type(failure).__name__} on embed, retrying in 1.0s"
+            ]
+
+    with gemini_fallback_env(), captured_gemini_logs() as records:
+        failures = [httpx.ConnectError("down")] * 4
+        with gemini_transport(failures) as (calls, sleeps):
+            try:
+                asyncio.run(gemini.embed(["a"], 1))
+                raise AssertionError("expected GeminiError")
+            except gemini.GeminiError as exc:
+                assert str(exc) == "Gemini transport error: ConnectError"
+        assert len(calls) == 4
+        assert sleeps == [1, 2, 4]
+        assert len(_retry_warnings(records)) == 3
+
+    mixed = [
+        httpx.Response(503),
+        httpx.ConnectError("down"),
+        httpx.Response(429),
+    ]
+    with gemini_fallback_env(), captured_gemini_logs() as records:
+        with gemini_transport([*mixed, _gemini_ok()]) as (calls, sleeps):
+            assert asyncio.run(gemini.embed(["a"], 1)) == [[0.1]]
+        assert len(calls) == 4
+        assert sleeps == [1, 2, 4]
+        assert len(_retry_warnings(records)) == 3
+
+    with gemini_fallback_env(), captured_gemini_logs() as records:
+        responses = [*mixed, httpx.Response(503, text="still down")]
+        with gemini_transport(responses) as (calls, sleeps):
+            try:
+                asyncio.run(gemini.embed(["a"], 1))
+                raise AssertionError("expected GeminiError")
+            except gemini.GeminiError as exc:
+                assert str(exc).startswith("Gemini 503:")
+        assert len(calls) == 4
+        assert sleeps == [1, 2, 4]
+        assert len(_retry_warnings(records)) == 3
+
+
+def test_gemini_non_retryable_and_invalid_responses_fail_once() -> None:
+    failures = [
+        *(httpx.Response(status, text="permanent") for status in (400, 401, 403, 404, 501, 505)),
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"embeddings": []}),
+        httpx.Response(200, json={"embeddings": [{"values": []}]}),
+    ]
+    for failure in failures:
+        with gemini_fallback_env(), captured_gemini_logs() as records:
+            with gemini_transport([failure]) as (calls, sleeps):
+                try:
+                    asyncio.run(gemini.embed(["a"], 1))
+                    raise AssertionError("expected GeminiError")
+                except gemini.GeminiError:
+                    pass
+            assert len(calls) == 1
+            assert sleeps == []
+            assert _retry_warnings(records) == []
+
+
+def test_gemini_retries_only_failed_chunk_and_preserves_order() -> None:
+    requests: list[list[str]] = []
+
+    def response_for(request: httpx.Request) -> httpx.Response:
+        texts = [
+            part["text"]
+            for item in json.loads(request.content)["requests"]
+            for part in item["content"]["parts"]
+        ]
+        requests.append(texts)
+        if len(requests) == 2:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"embeddings": [
+            {"values": [float(text.removeprefix("t"))]} for text in texts
+        ]})
+
+    responses = [response_for] * 3
+    calls: list[httpx.Request] = []
+    sleeps: list[float] = []
+    original_client = gemini.httpx.AsyncClient
+    original_sleep = asyncio.sleep
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return responses[len(calls) - 1](request)
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    transport = httpx.MockTransport(handler)
+    gemini.httpx.AsyncClient = lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+    asyncio.sleep = record_sleep
+    try:
+        with captured_gemini_logs() as records:
+            got = asyncio.run(gemini.embed([f"t{i}" for i in range(97)], 1))
+    finally:
+        gemini.httpx.AsyncClient = original_client
+        asyncio.sleep = original_sleep
+    assert requests == [
+        [f"t{i}" for i in range(96)],
+        ["t96"],
+        ["t96"],
+    ]
+    assert got == [[float(i)] for i in range(97)]
+    assert sleeps == [1]
+    assert _retry_warnings(records) == [
+        "Gemini 503 on embed, retrying in 1.0s"
+    ]
+
+
 def test_gemini_request_shape_chunking_and_order() -> None:
     calls: list[httpx.Request] = []
 
@@ -1884,7 +2175,8 @@ def test_gemini_failures_include_both_errors_and_alert_once() -> None:
             gemini.embed = __import__("app.gemini", fromlist=["embed"]).embed
             alerts.on_gemini_error = capture
             try:
-                response = _post("/embed", {"texts": ["a"], "dims": 1}, "failure")
+                with recorded_sleeps():
+                    response = _post("/embed", {"texts": ["a"], "dims": 1}, "failure")
             finally:
                 gemini.httpx.AsyncClient = original_client
             assert response.status_code == 502
@@ -1895,7 +2187,11 @@ def test_gemini_failures_include_both_errors_and_alert_once() -> None:
 
 def test_gemini_secret_boundary() -> None:
     requests: list[httpx.Request] = []
-    with gemini_fallback_env(), captured_gateway_logs() as records:
+    with (
+        gemini_fallback_env(),
+        captured_gateway_logs() as records,
+        captured_gemini_logs() as gemini_records,
+    ):
         original_client = gemini.httpx.AsyncClient
 
         async def primary(texts, dims):
@@ -1917,13 +2213,16 @@ def test_gemini_secret_boundary() -> None:
         openrouter.embed = primary
         alerts.on_gemini_error = capture
         try:
-            response = _post("/embed", {"texts": ["a"], "dims": 1}, "secret")
+            with recorded_sleeps():
+                response = _post("/embed", {"texts": ["a"], "dims": 1}, "secret")
         finally:
             gemini.httpx.AsyncClient = original_client
         assert response.status_code == 502
+        assert len(requests) == 4
         assert requests[0].headers["x-goog-api-key"] == GEMINI_DUMMY_KEY
         assert GEMINI_DUMMY_KEY not in response.text
         assert GEMINI_DUMMY_KEY not in "".join(r.getMessage() for r in records)
+        assert GEMINI_DUMMY_KEY not in "".join(r.getMessage() for r in gemini_records)
         assert GEMINI_DUMMY_KEY not in "".join(alerted)
         health = TestClient(app).get("/health").text
         get_config = TestClient(app).get("/config", headers={"X-API-Key": config.API_KEY}).text

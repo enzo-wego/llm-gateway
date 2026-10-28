@@ -45,6 +45,10 @@ All routes except `/health` require `X-API-Key`.
 | `GET /health` | — | quota state, counters, active backends |
 | `GET /usage` | — | seat and OpenRouter budget, plus per-caller `callers` counters |
 
+The Gemini fallback retries HTTP 429, 500, 502, 503, 504 and network errors up
+to 3 times (1, 2, 4 s, or `Retry-After` up to 10 s for 429 and 503) before
+failing.
+
 Every request to `/generate`, `/describe` and `/embed` may carry an optional
 `X-LLM-Caller` header naming who made it, e.g. `p-agent/bot-comment` or
 `agent-mem`. It must match `^[a-z0-9][a-z0-9/_-]{0,63}$` (lowercase letters,

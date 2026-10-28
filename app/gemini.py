@@ -1,10 +1,20 @@
 """Direct Gemini API client for embedding fallback only."""
 
+import asyncio
+import logging
 from typing import Any
 
 import httpx
 
 from . import config
+from .openrouter import _retry_after
+
+log = logging.getLogger("llm-gateway.gemini")
+
+_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+# ponytail: retries can outlast the caller's timeout when Gemini hangs; upgrade:
+# an overall per-request deadline.
+_RETRY_DELAYS_S = (1, 2, 4)
 
 _GEMINI_MAX_BATCH = 96
 _TIMEOUT_S = 60
@@ -40,11 +50,36 @@ async def embed(texts: list[str], dims: int) -> list[list[float]]:
                 for text in chunk
             ]
         }
-        try:
-            async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
-                response = await client.post(url, headers=headers, json=payload)
-        except httpx.HTTPError as exc:
-            raise _error(f"Gemini transport error: {type(exc).__name__}") from exc
+        async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
+            for delay in (*_RETRY_DELAYS_S, None):
+                try:
+                    response = await client.post(url, headers=headers, json=payload)
+                except httpx.HTTPError as exc:
+                    if delay is None:
+                        raise _error(
+                            f"Gemini transport error: {type(exc).__name__}"
+                        ) from exc
+                    log.warning(
+                        "Gemini transport error %s on embed, retrying in %.1fs",
+                        type(exc).__name__,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                if response.status_code not in _RETRYABLE_STATUSES or delay is None:
+                    break
+                wait = (
+                    _retry_after(response, delay)
+                    if response.status_code in {429, 503}
+                    else delay
+                )
+                log.warning(
+                    "Gemini %s on embed, retrying in %.1fs",
+                    response.status_code,
+                    wait,
+                )
+                await asyncio.sleep(wait)
 
         if response.status_code != 200:
             raise _error(f"Gemini {response.status_code}: {response.text}")
