@@ -11,15 +11,35 @@ import logging
 import time
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from . import alerts, claude, config, openrouter
+from . import admin, alerts, claude, config, gemini_proxy, gemini_store, openrouter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("llm-gateway")
+# Not a child of "llm-gateway": per-request access lines must not mix into its handlers.
+access_log_ = logging.getLogger("gw-access")
 
 app = FastAPI(title="llm-gateway", docs_url=None, redoc_url=None)
+app.include_router(gemini_proxy.router)
+app.include_router(admin.router)
+
+
+@app.middleware("http")
+async def access_log(request: Request, call_next):
+    """method path status latency_ms. Never the query string: a caller that
+    mistakenly sends ?key=<real key> must not land it in the logs. Replaces
+    uvicorn's access log (Dockerfile passes --no-access-log)."""
+    started = time.monotonic()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        access_log_.info("%s %s %s %dms", request.method, request.url.path, status,
+                 int((time.monotonic() - started) * 1000))
 
 
 # ── quota state ──────────────────────────────────────────────────────────────
@@ -280,8 +300,10 @@ async def put_config(body: dict[str, Any]) -> dict[str, Any]:
 @app.get("/health")
 async def health() -> dict[str, Any]:
     """Unauthenticated: it exposes no secrets and systemd/uptime checks need it."""
+    pool = gemini_store.pool_counts() if gemini_store.enabled() else None
     return {
         "ok": True,
+        **({"gemini_pool": pool} if pool is not None else {}),
         "backends": {
             "summary": config.BACKEND_SUMMARY,
             "cheap": config.BACKEND_CHEAP,
@@ -320,5 +342,7 @@ async def _startup() -> None:
         config.EMBED_MODEL,
         config.FALLBACK_ON_QUOTA, config.ALERTS_ENABLED,
     )
+    if not config.OPENROUTER_KEY:
+        log.warning("OPENROUTER_API_KEY unset — /generate fallback, /describe and /embed will answer 502")
     if not config.ALERTS_ENABLED:
         log.warning("Slack alerting disabled — quota exhaustion will only be logged")

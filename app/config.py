@@ -129,7 +129,9 @@ CLAUDE_TIMEOUT_S = _int("LLM_GATEWAY_CLAUDE_TIMEOUT_S", 180)
 # Embeddings cannot move to Claude: Anthropic has no embeddings API, and the
 # stored vectors (768 flat / 3072 graph) are all gemini-embedding-001. Keeping
 # the exact model id preserves the vector space, so nothing needs re-embedding.
-OPENROUTER_KEY = _req("OPENROUTER_API_KEY")
+# Optional: an instance that only serves the Gemini pool has no OpenRouter key.
+# openrouter._headers() raises on the legacy routes when it is empty.
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_BASE = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 EMBED_MODEL = os.getenv("LLM_GATEWAY_EMBED_MODEL", "google/gemini-embedding-001")
 
@@ -340,3 +342,13 @@ def update_config(updates: dict[str, Any]) -> dict[str, Any]:
             _rewrite_env(ENV_FILE, validated)
             globals().update(validated)
         return {name: globals()[name] for name in EDITABLE_ENV_KEYS}
+
+# ── Gemini key pool (pass-through proxy + admin page) ────────────────────────
+# Without SECRET_KEY the /gemini routes and /admin answer 503 and the rest of
+# the service is unaffected. Keys are Fernet-encrypted with a key derived from it.
+SECRET_KEY = os.getenv("LLM_GATEWAY_SECRET_KEY", "").strip()
+ADMIN_PASSWORD = os.getenv("LLM_GATEWAY_ADMIN_PASSWORD", "").strip()
+DB_PATH = os.getenv("LLM_GATEWAY_DB_PATH", "/data/gateway.db")
+GEMINI_UPSTREAM = os.getenv(
+    "LLM_GATEWAY_GEMINI_UPSTREAM", "https://generativelanguage.googleapis.com"
+).strip().rstrip("/")

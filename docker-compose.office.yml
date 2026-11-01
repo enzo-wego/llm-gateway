@@ -1,0 +1,35 @@
+# Office box override. Layered on docker-compose.yml, always with the explicit set:
+#   docker compose -p llm-gateway -f docker-compose.yml -f docker-compose.office.yml up -d --build
+#
+# GATEWAY_BIND (the host address to publish on) is read from ~/llm-gateway/.env on
+# the server, which Compose uses for interpolation. It is not committed.
+services:
+  llm-gateway:
+    build:
+      args:
+        # Match the login user so the container can read the bind-mounted config/.env.
+        APP_UID: "1000"
+        APP_GID: "1000"
+    # !override REPLACES the base loopback publish instead of adding a second one.
+    ports: !override
+      - "${GATEWAY_BIND:?set GATEWAY_BIND in ~/llm-gateway/.env}:8791:8750"
+    networks:
+      - chatbot_default
+    volumes:
+      # Merged with the base list by mount target; only /data is new.
+      - gateway-data:/data
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  chatbot_default:
+    external: true
+
+volumes:
+  gateway-data:

@@ -26,6 +26,8 @@ class OpenRouterError(RuntimeError):
 
 
 def _headers() -> dict[str, str]:
+    if not config.OPENROUTER_KEY:
+        raise OpenRouterError("OPENROUTER_API_KEY is not configured")
     return {"Authorization": f"Bearer {config.OPENROUTER_KEY}", "Content-Type": "application/json"}
 
 

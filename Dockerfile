@@ -33,6 +33,10 @@ RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 ENV HOME=/home/app \
     PYTHONUNBUFFERED=1
 
+# SQLite lives in /data (LLM_GATEWAY_DB_PATH). A fresh named volume mounted
+# there inherits this ownership, so the non-root user can write the database.
+RUN mkdir -p /data && chown app:app /data
+
 USER app
 
 EXPOSE 8750
@@ -43,7 +47,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8750/health', timeout=3)"]
 
 # The entrypoint loads config/.env into the environment, then execs this CMD.
+# --no-access-log: uvicorn would print query strings (a mistaken ?key=...);
+# app/main.py logs method + path + status instead.
 # Bind 0.0.0.0 inside the container; host exposure is controlled by the compose
 # port publish, not by the app.
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8750", "--log-level", "info"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8750", "--log-level", "info", "--no-access-log"]
