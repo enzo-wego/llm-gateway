@@ -256,10 +256,14 @@ async def add_key(request: Request) -> Response:
     if any(ch.isspace() for ch in key):
         return _dashboard("Key must not contain whitespace.", 400)
     ok, reason = await check_key(key)
-    if not ok:
+    rate_limited = not ok and reason.startswith("429")
+    if not ok and not rate_limited:
         return _dashboard(f"Key refused: {reason}", 400)
     if store.add_key(label, key) is None:
         return _dashboard("Key already in the pool (same fingerprint).", 409)
+    if rate_limited:
+        return _dashboard(f"Key added, but its project is rate-limited right now ({reason}). "
+                          "It is valid; use Test later to confirm.")
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -278,7 +282,8 @@ async def key_action(key_id: int, action: str, request: Request) -> Response:
         secret = store.plaintext(row)
         ok, reason = await check_key(secret) if secret else (False, "decrypt failed")
         if ok:
-            store.set_status(key_id, "active")
+            if row["status"] == "rejected":
+                store.set_status(key_id, "active")
         elif reason.startswith(("401", "403")) or "API_KEY_INVALID" in reason:
             store.mark_rejected(key_id, reason)
         return _dashboard(f"Test of {row['label']}: {reason}")

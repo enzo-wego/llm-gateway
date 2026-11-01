@@ -32,11 +32,13 @@ class Upstream:
 
     def __init__(self):
         self.seen: list[tuple[str, str]] = []
+        self.bodies: list[bytes] = []
         self.script: dict[str, list] = {}  # key -> responses (cycled last); default 200
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
         key = req.headers.get("x-goog-api-key", "")
         self.seen.append((str(req.url), key))
+        self.bodies.append(req.content)
         steps = self.script.get(key)
         if steps:
             step = steps.pop(0) if len(steps) > 1 else steps[0]
@@ -389,6 +391,36 @@ def test_no_failover_after_first_byte(live):
     assert len(hits) == 1  # second key never tried
 
 
+def test_stream_fails_over_on_429_before_first_byte(client, env):
+    add(2)
+    env.script[KEYS[0]] = [(429, {}, b'{"error":{"status":"RESOURCE_EXHAUSTED"}}')]
+    r = post(client, path=STREAM)
+    assert r.status_code == 200
+    assert env.keys_used == [KEYS[0], KEYS[1]]
+
+
+def test_request_body_forwarded_byte_for_byte(client, env):
+    add(1)
+    body = '{"contents":[{"parts":[{"text":"héllo  \u2603 \n\t"}]}] }'.encode("utf-8") + b"\x00\xff"
+    assert post(client, body=body).status_code == 200
+    assert env.bodies == [body]
+
+
+def test_client_disconnect_mid_stream_still_logs(live):
+    add(1)
+    release, _, port = live()
+    with httpx.Client(timeout=httpx.Timeout(3.0)) as c:
+        with c.stream("POST", f"http://127.0.0.1:{port}{STREAM}", headers=H, content=b"{}") as r:
+            assert b"chunk1" in next(r.iter_raw())
+        # leaving the block closes the connection before chunk2
+    deadline = time.time() + 5
+    while time.time() < deadline and not store.recent_requests(10):
+        time.sleep(0.05)
+    release.set()
+    rows = store.recent_requests(10)
+    assert len(rows) == 1 and rows[0]["route"].endswith("streamGenerateContent")
+
+
 # ── admin ────────────────────────────────────────────────────────────────────
 ORIGIN = {"Origin": "http://testserver"}
 
@@ -457,6 +489,32 @@ def test_admin_add_test_disable_delete(client, env):
     assert row(kid) is not None
     client.post(f"/admin/keys/{kid}/delete", data={"confirm": "yes"}, headers=ORIGIN)
     assert row(kid) is None
+
+
+def test_test_does_not_reenable_disabled_key_but_rejected_returns(client, env):
+    login(client)
+    (kid,) = add(1)
+    store.set_status(kid, "disabled")
+    assert "Test of k0: ok" in client.post(f"/admin/keys/{kid}/test", headers=ORIGIN).text
+    assert row(kid)["status"] == "disabled"
+    store.set_status(kid, "active")
+    store.mark_rejected(kid, "403")
+    assert row(kid)["status"] == "rejected"
+    client.post(f"/admin/keys/{kid}/test", headers=ORIGIN)
+    assert row(kid)["status"] == "active"
+
+
+def test_admin_add_key_429_saved_with_note_but_invalid_refused(client, env):
+    login(client)
+    env.script[KEYS[0]] = [(429, {}, b'{"error":{"status":"RESOURCE_EXHAUSTED"}}')]
+    r = client.post("/admin/keys", data={"label": "busy", "key": KEYS[0]}, headers=ORIGIN)
+    assert r.status_code == 200 and "rate-limited" in r.text
+    assert [k["label"] for k in store.list_keys()] == ["busy"]
+    for i, st in ((1, 401), (2, 403)):
+        env.script[KEYS[i]] = [(st, {}, b"{}")]
+        assert client.post("/admin/keys", data={"label": f"x{i}", "key": KEYS[i]},
+                           headers=ORIGIN).status_code == 400
+    assert len(store.list_keys()) == 1
 
 
 def test_admin_shows_recent_requests(client, env):
