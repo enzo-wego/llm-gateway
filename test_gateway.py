@@ -1073,6 +1073,7 @@ class _AlertCtl:
         self.now = 1000.0
         self.resp = {"ok": True}
         self.yield_in_post = False
+        self.gate: asyncio.Event | None = None
 
 
 @contextmanager
@@ -1104,6 +1105,8 @@ def isolated_alerts(posts: list):
         async def post(self, *a, **k):
             if ctl.yield_in_post:
                 await asyncio.sleep(0)
+            if ctl.gate is not None:
+                await ctl.gate.wait()
             if isinstance(ctl.resp, httpx.ConnectError):
                 raise ctl.resp
             posts.append(k.get("json"))
@@ -2399,6 +2402,517 @@ def test_retry_after_is_capped_and_ignores_garbage() -> None:
     assert openrouter._retry_after(r("nan"), 1) == 1
     assert openrouter._retry_after(r("soon"), 2) == 2
     assert openrouter._retry_after(httpx.Response(429), 4) == 4
+
+# ── Claude auth alert: debounce, text, recovery ──────────────────────────────
+
+
+@contextmanager
+def auth_alerts(posts: list, after_s: int = 600):
+    saved = config.CLAUDE_AUTH_ALERT_AFTER_S
+    with isolated_alerts(posts) as ctl:
+        config.CLAUDE_AUTH_ALERT_AFTER_S = after_s
+        try:
+            yield ctl
+        finally:
+            config.CLAUDE_AUTH_ALERT_AFTER_S = saved
+
+
+async def _auth_fail(ctl, at) -> None:
+    ctl.now = float(at)
+    await alerts.on_claude_error("authentication_failed")
+
+
+def _auth_ok(ctl, at) -> None:
+    ctl.now = float(at)
+    alerts.on_claude_ok()
+
+
+async def _drain_auth_tasks() -> None:
+    while True:
+        pending = [
+            t for t in (alerts._auth_outage_task, alerts._auth_recovery_task)
+            if t is not None and not t.done()
+        ]
+        if not pending:
+            break
+        await asyncio.gather(*pending)
+    await asyncio.sleep(0)
+
+
+async def _let_posts_start() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def _kinds(posts: list) -> list[str]:
+    out = []
+    for p in posts:
+        text = p["text"]
+        out.append("recovered" if "accepted again" in text else "outage" if "rejected" in text else text)
+    return out
+
+
+def test_auth_alert_single_failure_posts_nothing() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert posts == []
+
+
+def test_auth_alert_failures_inside_window_post_nothing() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        for at in (1000, 1300, 1599):
+            await _auth_fail(ctl, at)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert posts == []
+
+
+def test_auth_alert_posts_once_past_threshold_with_correct_text() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _auth_fail(ctl, 1600)
+        await _drain_auth_tasks()
+        for at in (1700, 2500, 2800):  # inside ALERT_DEDUPE_S
+            await _auth_fail(ctl, at)
+            await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert len(posts) == 1, posts
+    text = posts[0]["text"]
+    assert "deploy/regen-token.sh" in text
+    assert "VPS" not in text and "systemctl" not in text
+    assert "for 10 min" in text
+
+
+def test_auth_recovery_posts_once_and_is_not_critical() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _auth_fail(ctl, 1600)
+        await _drain_auth_tasks()
+        _auth_ok(ctl, 1700)
+        await _drain_auth_tasks()
+        _auth_ok(ctl, 1800)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage", "recovered"], posts
+    assert posts[0]["text"].startswith("🚨")
+    assert posts[1]["text"].startswith("⚠️")
+
+
+def test_auth_success_before_threshold_resets_the_streak_clock() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        _auth_ok(ctl, 1100)
+        await _auth_fail(ctl, 1700)  # new streak; 700 s after the old start
+        await _auth_fail(ctl, 2200)  # only 500 s into the new streak
+        await _drain_auth_tasks()
+        assert posts == []
+        await _auth_fail(ctl, 2300)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage"], posts
+
+
+def test_auth_two_incidents_inside_dedupe_window_alert_in_order() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _auth_fail(ctl, 1600)
+        await _drain_auth_tasks()
+        _auth_ok(ctl, 1700)
+        await _drain_auth_tasks()
+        await _auth_fail(ctl, 1800)
+        await _auth_fail(ctl, 2400)
+        await _drain_auth_tasks()
+        _auth_ok(ctl, 2500)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage", "recovered", "outage", "recovered"], posts
+
+
+def test_auth_ok_without_streak_is_free() -> None:
+    posts: list = []
+    with auth_alerts(posts) as ctl:
+        alerts.on_claude_ok()  # no running loop: a task here would raise
+        assert alerts._auth_recovery_task is None and alerts._auth_outage_task is None
+        assert not os.path.exists(ctl.state_path)
+    assert posts == []
+
+
+def test_billing_error_still_alerts_immediately() -> None:
+    posts: list = []
+    with auth_alerts(posts):
+        asyncio.run(alerts.on_claude_error("billing_error"))
+    assert len(posts) == 1 and "billing error" in posts[0]["text"]
+
+
+def test_auth_ok_while_outage_post_in_flight_still_recovers_once() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        ctl.gate = asyncio.Event()
+        await _auth_fail(ctl, 1600)
+        await _let_posts_start()
+        assert posts == []
+        _auth_ok(ctl, 1700)
+        ctl.gate.set()
+        await _drain_auth_tasks()
+        assert alerts._auth_recovery_owed is False
+        assert alerts._auth_outage_task is None and alerts._auth_recovery_task is None
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage", "recovered"], posts
+
+
+def test_auth_new_streak_during_in_flight_post_keeps_both_incidents() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        ctl.gate = asyncio.Event()
+        await _auth_fail(ctl, 1600)
+        await _let_posts_start()
+        _auth_ok(ctl, 1700)  # closes streak A
+        await _auth_fail(ctl, 1800)  # opens streak B
+        a_id = alerts._auth_streak - 1
+        ctl.gate.set()
+        await _drain_auth_tasks()
+        assert _kinds(posts) == ["outage", "recovered"], posts
+        assert alerts._auth_since is not None
+        assert alerts._auth_alerted_streak == a_id
+        assert alerts._auth_recovery_owed is False
+        await _auth_fail(ctl, 2400)
+        await _drain_auth_tasks()
+        _auth_ok(ctl, 2500)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage", "recovered", "outage", "recovered"], posts
+
+
+def test_auth_next_outage_waits_for_undelivered_recovery() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _auth_fail(ctl, 1600)
+        await _drain_auth_tasks()
+        ctl.resp = {"ok": False}
+        _auth_ok(ctl, 1700)  # A's recovery is attempted and fails
+        await _drain_auth_tasks()
+        assert alerts._auth_recovery_owed is True
+        await _auth_fail(ctl, 1800)  # opens B
+        await _auth_fail(ctl, 2400)  # B past threshold
+        await _drain_auth_tasks()
+        assert _kinds(posts) == ["outage", "recovered"]  # only the failed attempt
+        ctl.resp = {"ok": True}
+        await _auth_fail(ctl, 3500)  # past the dedupe window: A's recovery
+        await _drain_auth_tasks()
+        assert _kinds(posts) == ["outage", "recovered", "recovered"]
+        assert alerts._auth_recovery_owed is False
+        await _auth_fail(ctl, 3600)  # now B's outage
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage", "recovered", "recovered", "outage"], posts
+
+
+def test_auth_delivery_failures_are_retried_not_forgotten() -> None:
+    for failure in ({"ok": False, "error": "x"}, httpx.ConnectError("down")):
+        posts: list = []
+
+        async def run(ctl) -> None:
+            ctl.resp = failure
+            await _auth_fail(ctl, 1000)
+            await _auth_fail(ctl, 1600)
+            await _drain_auth_tasks()
+            assert alerts._auth_recovery_owed is False
+            assert alerts._auth_alerted_streak is None
+            ctl.resp = {"ok": True}
+            await _auth_fail(ctl, 1700)  # inside dedupe: suppressed
+            await _drain_auth_tasks()
+            await _auth_fail(ctl, 3500)
+            await _drain_auth_tasks()
+            assert alerts._auth_recovery_owed is True
+            ctl.resp = failure
+            _auth_ok(ctl, 3600)  # recovery delivery fails
+            await _drain_auth_tasks()
+            assert alerts._auth_recovery_owed is True
+            ctl.resp = {"ok": True}
+            alerts.on_claude_ok()  # still inside the recovered-key dedupe
+            await _drain_auth_tasks()
+            assert alerts._auth_recovery_owed is True
+            _auth_ok(ctl, 3600 + 1801)
+            await _drain_auth_tasks()
+            assert alerts._auth_recovery_owed is False
+
+        with auth_alerts(posts) as ctl:
+            asyncio.run(run(ctl))
+        assert _kinds(posts)[0] == "outage" and _kinds(posts)[-1] == "recovered"
+
+
+def test_auth_threshold_zero_alerts_on_first_failure_and_env_clamps() -> None:
+    posts: list = []
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts, after_s=0) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage"], posts
+
+    import importlib
+
+    snapshot = {k: v for k, v in vars(config).items() if k.isupper()}
+    old_env = os.environ.get("LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S")
+    try:
+        os.environ["LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S"] = "-5"
+        importlib.reload(config)
+        assert config.CLAUDE_AUTH_ALERT_AFTER_S == 0
+        os.environ.pop("LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S")
+        importlib.reload(config)
+        assert config.CLAUDE_AUTH_ALERT_AFTER_S == 600
+    finally:
+        if old_env is None:
+            os.environ.pop("LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S", None)
+        else:
+            os.environ["LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S"] = old_env
+        for k, v in snapshot.items():
+            setattr(config, k, v)
+
+
+# Fake SDK pieces for driving claude._run. _run dispatches on the class name.
+
+
+class AssistantMessage:
+    def __init__(self, text="", error=None) -> None:
+        self.content = [SimpleNamespace(text=text)] if text else []
+        self.error = error
+
+
+class ResultMessage:
+    def __init__(self, structured=None, is_error=False, errors=None) -> None:
+        self.structured_output = structured
+        self.is_error = is_error
+        self.errors = errors or []
+        self.total_cost_usd = 0.0
+        self.usage = {}
+        self.stop_reason = "end_turn"
+        self.duration_ms = 1
+        self.num_turns = 1
+
+
+class RateLimitEvent:
+    def __init__(self, status="rejected") -> None:
+        self.rate_limit_info = SimpleNamespace(
+            status=status, rate_limit_type="five_hour", resets_at=None, utilization=None
+        )
+
+
+def _fake_sdk_client(messages=(), connect_exc=None, hang=None):
+    state = SimpleNamespace(disconnected=False)
+
+    class FakeClient:
+        def __init__(self, options) -> None:
+            pass
+
+        async def connect(self, prompt) -> None:
+            if connect_exc is not None:
+                raise connect_exc
+
+        async def receive_response(self):
+            if hang is not None:
+                hang.set()
+                await asyncio.Event().wait()
+            for m in messages:
+                yield m
+
+        async def disconnect(self) -> None:
+            state.disconnected = True
+
+    return FakeClient, state
+
+
+@contextmanager
+def patched_sdk_client(cls):
+    original = claude.sdk.ClaudeSDKClient
+    claude.sdk.ClaudeSDKClient = cls
+    try:
+        yield
+    finally:
+        claude.sdk.ClaudeSDKClient = original
+
+
+_RUN_OPTS = SimpleNamespace(model="m")
+
+
+def test_run_hook_closes_streak_only_after_auth_was_accepted() -> None:
+    cases = [
+        ("text", [AssistantMessage("hi"), ResultMessage()], None, True),
+        ("structured", [ResultMessage(structured={"a": 1})], None, True),
+        ("empty", [ResultMessage()], claude.ClaudeError, True),
+        ("assistant error", [AssistantMessage("x", error="billing_error")], claude.ClaudeError, False),
+        ("result error", [ResultMessage(is_error=True, errors=["boom"])], claude.ClaudeError, False),
+        ("quota", [RateLimitEvent("rejected")], claude.QuotaExhausted, False),
+        ("sdk error", "connect", claude.ClaudeError, False),
+    ]
+    for name, msgs, exc_type, closes in cases:
+        posts: list = []
+
+        async def run(ctl) -> None:
+            await _auth_fail(ctl, 1000)
+            assert alerts._auth_since is not None
+            if msgs == "connect":
+                cls, _ = _fake_sdk_client(connect_exc=RuntimeError("spawn failed"))
+            else:
+                cls, _ = _fake_sdk_client(msgs)
+            with patched_sdk_client(cls):
+                try:
+                    result = await claude._run("p", _RUN_OPTS)
+                except Exception as e:  # noqa: BLE001
+                    assert exc_type is not None and type(e) is exc_type, (name, e)
+                else:
+                    assert exc_type is None, name
+                    assert result
+            await _drain_auth_tasks()
+            assert (alerts._auth_since is None) == closes, name
+            assert alerts._auth_recovery_task is None, name
+
+        with auth_alerts(posts) as ctl:
+            asyncio.run(run(ctl))
+
+
+def test_run_empty_response_keeps_its_error_message() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        cls, _ = _fake_sdk_client([ResultMessage()])
+        with patched_sdk_client(cls):
+            try:
+                await claude._run("p", _RUN_OPTS)
+            except claude.ClaudeError as e:
+                assert str(e) == "empty response from Claude"
+            else:
+                raise AssertionError("empty response was accepted")
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+
+
+def test_guarded_success_does_not_wait_for_slack_recovery_post() -> None:
+    posts: list = []
+    saved_timeout = config.CLAUDE_TIMEOUT_S
+    handler_records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record) -> None:
+            if record.levelno >= logging.ERROR:
+                handler_records.append(record)
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _auth_fail(ctl, 1600)
+        await _drain_auth_tasks()
+        assert alerts._auth_recovery_owed and alerts._auth_since is not None
+        ctl.gate = asyncio.Event()  # never set
+        cls, _ = _fake_sdk_client([AssistantMessage("hi"), ResultMessage()])
+        with patched_sdk_client(cls):
+            result = await asyncio.wait_for(claude._guarded("p", _RUN_OPTS), 1)
+        assert result["text"] == "hi"
+        await _let_posts_start()
+        task = alerts._auth_recovery_task
+        assert task is not None and not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert alerts._auth_recovery_task is None and alerts._auth_outage_task is None
+
+    handler = Capture()
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        config.CLAUDE_TIMEOUT_S = 2
+        with auth_alerts(posts) as ctl:
+            asyncio.run(run(ctl))
+    finally:
+        config.CLAUDE_TIMEOUT_S = saved_timeout
+        root.removeHandler(handler)
+    errors = [r for r in handler_records if r.name != "llm-gateway.alerts" or "ALERT [" not in r.getMessage()]
+    assert errors == [], [r.getMessage() for r in errors]
+
+
+def test_timeout_and_cancellation_leave_the_streak_open() -> None:
+    posts: list = []
+    saved_timeout = config.CLAUDE_TIMEOUT_S
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+
+        # (a) deadline
+        started = asyncio.Event()
+        cls, state = _fake_sdk_client(hang=started)
+        config.CLAUDE_TIMEOUT_S = 1
+        with patched_sdk_client(cls):
+            try:
+                await claude._guarded("p", _RUN_OPTS)
+            except claude.ClaudeError as e:
+                assert str(e) == "timed out after 1s"
+            else:
+                raise AssertionError("hung call did not time out")
+        assert state.disconnected
+        assert alerts._auth_since is not None and alerts._auth_recovery_task is None
+
+        # (b) external cancellation
+        started = asyncio.Event()
+        cls, state = _fake_sdk_client(hang=started)
+        with patched_sdk_client(cls):
+            task = asyncio.create_task(claude._run("p", _RUN_OPTS))
+            await started.wait()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("cancellation was swallowed")
+        assert state.disconnected
+        assert alerts._auth_since is not None and alerts._auth_recovery_task is None
+
+    try:
+        with auth_alerts(posts) as ctl:
+            asyncio.run(run(ctl))
+    finally:
+        config.CLAUDE_TIMEOUT_S = saved_timeout
+    assert posts == []
+
 
 if __name__ == "__main__":
     os.environ["ANTHROPIC_API_KEY"] = "sk-ant-should-be-stripped"

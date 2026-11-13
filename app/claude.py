@@ -205,6 +205,7 @@ async def _run(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, Any]:
         raise QuotaExhausted(meta.get("rate_limit", {}).get("type") or "quota")
     if fatal:
         raise ClaudeError(fatal)
+    alerts.on_claude_ok()
 
     if structured is None:
         joined = "".join(text_parts).strip()
