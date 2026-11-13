@@ -125,6 +125,10 @@ MAX_BUDGET_USD = float(os.getenv("LLM_GATEWAY_MAX_BUDGET_USD", "0.50"))
 # call would otherwise hold a worker slot indefinitely.
 CLAUDE_TIMEOUT_S = _int("LLM_GATEWAY_CLAUDE_TIMEOUT_S", 180)
 
+# authentication_failed can be a brief Anthropic-side rejection. Alert only after
+# failures last this long with no success in between; 0 alerts on the first one.
+CLAUDE_AUTH_ALERT_AFTER_S = max(0, _int("LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S", 600))
+
 # ── OpenRouter primary and Gemini embedding fallback ─────────────────────────
 # Embeddings cannot move to Claude: Anthropic has no embeddings API, and the
 # stored vectors (768 flat / 3072 graph) are all gemini-embedding-001. Keeping

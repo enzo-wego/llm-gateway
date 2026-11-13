@@ -84,11 +84,26 @@ def _save() -> None:
 def _reset_state() -> None:
     """Test helper: forget in-memory state so the next alert() reloads the file."""
     _suppressed.clear()
-    global _loaded
+    global _loaded, _auth_streak, _auth_since, _auth_alerted_streak, _auth_recovery_owed
+    global _auth_outage_task, _auth_recovery_task
     _loaded = False
+    _auth_streak = 0
+    _auth_since = None
+    _auth_alerted_streak = None
+    _auth_recovery_owed = False
+    for t in (_auth_outage_task, _auth_recovery_task):
+        if t is not None and not t.done():
+            try:
+                t.cancel()
+            except RuntimeError:  # its loop is already closed
+                pass
+    _auth_outage_task = None
+    _auth_recovery_task = None
 
 
-async def alert(key: str, text: str, *, critical: bool = True, until: float | None = None) -> None:
+async def alert(
+    key: str, text: str, *, critical: bool = True, until: float | None = None
+) -> bool:
     """Post text to Slack unless an identical key fired recently.
 
     key identifies the *condition*, not the occurrence — e.g.
@@ -98,13 +113,16 @@ async def alert(key: str, text: str, *, critical: bool = True, until: float | No
 
     If until (unix ts) is given and Slack accepts the post, the key stays
     muted until then; otherwise it is muted for ALERT_DEDUPE_S.
+
+    Returns True when the post was delivered (or alerts are disabled), False
+    when the key was suppressed or delivery failed.
     """
     now = time.time()
     async with _lock:
         if not _loaded:
             _load(now)
         if now < _suppressed.get(key, 0.0):
-            return
+            return False
         _suppressed[key] = now + config.ALERT_DEDUPE_S
         # Opportunistic sweep; the dict is tiny and this avoids a background task.
         for k, exp in list(_suppressed.items()):
@@ -145,6 +163,7 @@ async def alert(key: str, text: str, *, critical: bool = True, until: float | No
         async with _lock:
             _suppressed[key] = until
             _save()
+    return delivered
 
 
 def _usable_reset(resets, now: float) -> float | None:
@@ -206,15 +225,118 @@ async def on_rate_limit(info) -> None:
         )
 
 
+# ── Claude auth streak ───────────────────────────────────────────────────────
+# authentication_failed can be a transient Anthropic-side rejection, so it only
+# pages after failures have lasted CLAUDE_AUTH_ALERT_AFTER_S with no success in
+# between, and a recovery message follows. State is per process and is touched
+# only in synchronous code, so each transition is atomic on one event loop.
+
+_auth_streak = 0
+_auth_since: float | None = None
+_auth_alerted_streak: int | None = None
+_auth_recovery_owed = False
+_auth_outage_task: asyncio.Task | None = None
+_auth_recovery_task: asyncio.Task | None = None
+
+_AUTH_OUTAGE_TEXT = (
+    "*Claude seat auth rejected* (`authentication_failed`) for {minutes} min. "
+    "Generation is down. If it does not clear, the token needs rotating: a human "
+    "runs `cd ~/src/github.com/llm-gateway && deploy/regen-token.sh` on the Mac mini."
+)
+_AUTH_RECOVERY_TEXT = (
+    "*Claude seat auth accepted again.* Calls are getting past authentication."
+)
+
+
+def _auth_task_done(which: str, task: asyncio.Task) -> None:
+    global _auth_outage_task, _auth_recovery_task
+    if which == "outage":
+        if _auth_outage_task is task:
+            _auth_outage_task = None
+    elif _auth_recovery_task is task:
+        _auth_recovery_task = None
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("Claude auth %s post failed: %r", which, exc)
+
+
+async def _post_auth_outage(streak_id: int, minutes: int) -> None:
+    global _auth_alerted_streak, _auth_recovery_owed
+    ok = await alert("auth:claude", _AUTH_OUTAGE_TEXT.format(minutes=minutes))
+    if not ok:
+        return
+    _auth_alerted_streak = streak_id
+    _auth_recovery_owed = True
+    async with _lock:
+        _suppressed.pop("auth:claude:recovered", None)
+        _save()
+    if _auth_since is None or _auth_streak != streak_id:
+        _start_recovery()
+
+
+async def _post_auth_recovery() -> None:
+    global _auth_recovery_owed
+    ok = await alert("auth:claude:recovered", _AUTH_RECOVERY_TEXT, critical=False)
+    if not ok:
+        return
+    _auth_recovery_owed = False
+    async with _lock:
+        _suppressed.pop("auth:claude", None)
+        _save()
+
+
+def _start_recovery() -> None:
+    global _auth_recovery_task
+    if _auth_recovery_task is None:
+        task = asyncio.create_task(_post_auth_recovery())
+        _auth_recovery_task = task
+        task.add_done_callback(lambda t: _auth_task_done("recovery", t))
+
+
+def on_claude_ok() -> None:
+    """A Claude call got past authentication. Synchronous; never posts inline."""
+    global _auth_since
+    if _auth_since is None and not _auth_recovery_owed:
+        return
+    if _auth_since is not None:
+        log.info(
+            "Claude auth accepted again after %.0fs of failures",
+            time.time() - _auth_since,
+        )
+        _auth_since = None
+    if _auth_recovery_owed:
+        _start_recovery()
+
+
+def _on_auth_failed() -> None:
+    global _auth_streak, _auth_since, _auth_outage_task
+    now = time.time()
+    if _auth_since is None:
+        _auth_streak += 1
+        _auth_since = now
+        log.warning("Claude authentication_failed; streak %d opened", _auth_streak)
+    if _auth_recovery_owed:
+        if _auth_alerted_streak != _auth_streak:
+            _start_recovery()
+        return
+    elapsed = now - _auth_since
+    if (
+        elapsed >= config.CLAUDE_AUTH_ALERT_AFTER_S
+        and _auth_alerted_streak != _auth_streak
+        and _auth_outage_task is None
+    ):
+        minutes = max(0, int(elapsed // 60))
+        task = asyncio.create_task(_post_auth_outage(_auth_streak, minutes))
+        _auth_outage_task = task
+        task.add_done_callback(lambda t: _auth_task_done("outage", t))
+
+
 async def on_claude_error(err: str) -> None:
     """Alert on a terminal AssistantMessage.error from the SDK."""
     if err == "authentication_failed":
-        await alert(
-            "auth:claude",
-            "*Claude CLI login expired on the VPS.* Generation is down until "
-            "someone re-authenticates: `claude setup-token` as the service user, "
-            "then `sudo systemctl restart llm-gateway`.",
-        )
+        _on_auth_failed()
     elif err == "billing_error":
         await alert("billing:claude", f"*Claude billing error* — `{err}`. Generation is down.")
     else:
