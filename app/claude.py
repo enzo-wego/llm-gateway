@@ -82,6 +82,8 @@ def _options(
         tools=[],
         allowed_tools=[],
         setting_sources=[],
+        # The gateway never resumes sessions; the transcripts filled the Docker disk.
+        extra_args={"no-session-persistence": None},
         max_turns=_MAX_TURNS,
         effort=effort,
         thinking={"type": thinking},

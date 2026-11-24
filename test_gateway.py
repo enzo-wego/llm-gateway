@@ -241,6 +241,8 @@ def test_options_pass_tier_thinking_to_the_sdk() -> None:
     # as configured instead of being pinned to disabled.
     assert claude._options("m", "medium", "adaptive", "", None).thinking == {"type": "adaptive"}
     assert claude._options("m", "low", "disabled", "", None).thinking == {"type": "disabled"}
+    opts = claude._options("m", "medium", "adaptive", "", None)
+    assert "no-session-persistence" in opts.extra_args and opts.extra_args["no-session-persistence"] is None
 
 
 def test_api_key_is_unset_at_import() -> None:
