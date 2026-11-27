@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 prompt = sys.stdin.read()
@@ -45,6 +46,10 @@ elif prompt == "escaped":
     print(chr(92) * (600 * 1024))
 elif prompt == "invalid-json":
     print("not JSON")
+elif prompt == "settings":
+    model = args[args.index("--model") + 1]
+    settings = tomllib.loads("\\n".join(args[i + 1] for i, arg in enumerate(args) if arg == "-c"))
+    print(f"{model}/{settings['model_reasoning_effort']}")
 elif "--output-schema" in args:
     schema = Path(args[args.index("--output-schema") + 1])
     instructions = next(arg for arg in args if arg.startswith("model_instructions_file="))
@@ -113,7 +118,7 @@ def test_system_and_user_stay_separate_and_schema_uses_a_fresh_workspace(
         "schema": schema,
         "system": "Private instructions",
         "user": "- user input\nwith a second line",
-        "tier": "summary",
+        "effort": "xhigh",
     }
     workspaces = set()
     for _ in range(2):
@@ -140,10 +145,31 @@ def test_plain_response_and_tcp_denial(worker: httpx.Client) -> None:
 
 
 @pytest.mark.parametrize(
+    ("settings", "resolved"),
+    [
+        ({}, "gpt-6.2-sol/medium"),
+        ({"model": "gpt-6.2-astra"}, "gpt-6.2-astra/medium"),
+        ({"effort": "low"}, "gpt-6.2-sol/low"),
+        ({"model": "gpt-6.2-astra", "effort": "xhigh"}, "gpt-6.2-astra/xhigh"),
+    ],
+)
+def test_cli_resolves_requested_model_and_effort_independently(
+    worker: httpx.Client, settings: dict[str, str], resolved: str
+) -> None:
+    response = worker.post("/generate", json={"user": "settings", **settings})
+    assert response.status_code == 200
+    assert response.json()["text"] == resolved
+
+
+@pytest.mark.parametrize(
     ("body", "status"),
     [
         (b'{"user":""}', 422),
         (b'{"user":"a","tier":"other"}', 422),
+        (b'{"user":"a","tier":"cheap"}', 422),
+        (b'{"user":"a","tier":null}', 422),
+        (b'{"user":"a","model":"--other"}', 422),
+        (b'{"user":"a","effort":"other"}', 422),
         (b'{"user":"a","schema":[]}', 422),
         (b"{" + b"x" * (1024 * 1024), 413),
     ],

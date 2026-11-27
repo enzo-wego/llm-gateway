@@ -11,6 +11,8 @@ text-in / JSON-out call. Every option here exists to remove something:
                                 extraction tasks, and thinking tokens come out of
                                 the seat's quota. Models that reject disabled
                                 (Sonnet 5.5) run adaptive, bounded by effort
+  thinking on overrides        omit the tier's setting so the CLI can use its
+                                model-specific default with the requested effort
   output_format json_schema     the model must return a parsed object; no
                                 brace-scraping the way internal/anthropic does
 
@@ -74,7 +76,7 @@ def _unwrap_fenced_block(text: str) -> str:
 
 
 def _options(
-    model: str, effort: str, thinking: str, system: str, schema: dict[str, Any] | None
+    model: str, effort: str, thinking: str | None, system: str, schema: dict[str, Any] | None
 ) -> sdk.ClaudeAgentOptions:
     return sdk.ClaudeAgentOptions(
         model=model,
@@ -86,7 +88,7 @@ def _options(
         extra_args={"no-session-persistence": None},
         max_turns=_MAX_TURNS,
         effort=effort,
-        thinking={"type": thinking},
+        thinking={"type": thinking} if thinking is not None else None,
         max_budget_usd=config.MAX_BUDGET_USD,
         output_format=({"type": "json_schema", "schema": schema} if schema else None),
     )
@@ -236,7 +238,7 @@ async def _guarded(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, An
 
 
 async def generate(
-    *, system: str, user: str, model: str, effort: str, thinking: str,
+    *, system: str, user: str, model: str, effort: str, thinking: str | None,
     schema: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Single-shot text generation."""
@@ -245,7 +247,7 @@ async def generate(
 
 async def describe(
     *, system: str, prompt: str, mime: str, data_b64: str, model: str, effort: str,
-    thinking: str, schema: dict[str, Any] | None,
+    thinking: str | None, schema: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Multimodal description. The attachment rides the streaming-input path,
     which is the only way to attach content blocks rather than a bare string.

@@ -20,10 +20,18 @@ os.environ.setdefault("LLM_GATEWAY_API_KEY", "test")
 
 from app import codex_gateway, config  # noqa: E402
 from app.main import app  # noqa: E402
+from codex_worker.cli import GenerateInput  # noqa: E402
 
 _P_KEY: Final = "p-agent-test-key"
 _MEM_KEY: Final = "agent-mem-test-key"
 _SHARED_KEY: Final = "legacy-test-key"
+
+
+def test_codex_model_and_effort_match_across_independently_packaged_services() -> None:
+    public = codex_gateway._CodexInput.model_json_schema()["properties"]
+    internal = GenerateInput.model_json_schema()["properties"]
+    assert public["model"] == internal["model"]
+    assert public["effort"] == internal["effort"]
 
 
 @pytest.fixture
@@ -126,20 +134,20 @@ def test_codex_does_not_fall_back_when_worker_socket_is_missing(
     ("request_body", "wire_body", "worker_result", "key"),
     [
         (
-            {"system": "private system", "user": "private prompt", "tier": "summary", "schema": {}},
-            {"system": "private system", "user": "private prompt", "tier": "summary", "schema": {}},
+            {"system": "private system", "user": "private prompt", "effort": "xhigh", "schema_": {}},
+            {"system": "private system", "user": "private prompt", "model": "gpt-6.2-sol", "effort": "xhigh", "schema": {}},
             {"output": {"answer": "structured"}, "meta": {"usage": {"input": 2}}},
             _P_KEY,
         ),
         (
-            {"user": "plain text", "socket": "/attacker.sock", "url": "http://attacker.invalid"},
-            {"system": "", "user": "plain text", "tier": "cheap", "schema": None},
+            {"user": "plain text", "model": "gpt-6.2-astra", "socket": "/attacker.sock", "url": "http://attacker.invalid"},
+            {"system": "", "user": "plain text", "model": "gpt-6.2-astra", "effort": "medium", "schema": None},
             {"text": "worker answer", "meta": {"model": "test-model"}},
             _MEM_KEY,
         ),
     ],
 )
-def test_codex_preserves_generate_contract_without_forwarding_caller_headers(
+def test_codex_forwards_settings_and_schema_without_forwarding_caller_headers(
     gateway: TestClient,
     monkeypatch: pytest.MonkeyPatch,
     request_body: dict[str, JsonValue],
@@ -178,7 +186,9 @@ def test_codex_preserves_generate_contract_without_forwarding_caller_headers(
         )
 
     assert response.status_code == 200
-    assert response.json() == {"backend": "codex", **worker_result}
+    expected = json.loads(result)
+    expected["meta"].update(model=wire_body["model"], effort=wire_body["effort"])
+    assert response.json() == {"backend": "codex", **expected}
     [(path, worker_headers, body)] = received
     assert path == "/generate"
     assert body == wire_body
@@ -190,7 +200,14 @@ def test_codex_preserves_generate_contract_without_forwarding_caller_headers(
 
 @pytest.mark.parametrize(
     ("body", "status"),
-    [(b'{"user":"private","tier":"not-a-tier"}', 422), (b"x" * (1024 * 1024 + 1), 413)],
+    [
+        *[(json.dumps({"user": "private", "tier": value}).encode(), 422)
+          for value in ("not-a-tier", "cheap", "summary", None)],
+        (b'{"user":"private","model":"--other"}', 422),
+        (b'{"user":"private","model":"' + b"g" * 129 + b'"}', 422),
+        (b'{"user":"private","effort":"other"}', 422),
+        (b"x" * (1024 * 1024 + 1), 413),
+    ],
 )
 def test_bad_requests_are_bounded_and_do_not_reach_worker(
     gateway: TestClient, monkeypatch: pytest.MonkeyPatch, body: bytes, status: int

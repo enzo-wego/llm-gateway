@@ -14,7 +14,6 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 from pydantic_core import PydanticCustomError
 
 MAX_BYTES: Final = 1024 * 1024
-Tier = Literal["cheap", "summary"]
 
 
 class GenerateInput(BaseModel):
@@ -26,7 +25,11 @@ class GenerateInput(BaseModel):
 
     system: str = ""
     user: str
-    tier: Tier = "cheap"
+    # The gateway image ships separately; keep these fields in sync with _CodexInput.
+    model: str = Field(
+        default="gpt-6.2-sol", max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    )
+    effort: Literal["low", "medium", "high", "xhigh"] = "medium"
     schema_: dict[str, JsonValue] | None = Field(default=None, alias="schema")
 
     @field_validator("user")
@@ -72,6 +75,8 @@ async def generate_text(body: GenerateInput) -> str:
         args = [
             str(executable),
             "exec",
+            "--model",
+            body.model,
             "--sandbox",
             "read-only",
             "--ephemeral",
@@ -89,9 +94,7 @@ async def generate_text(body: GenerateInput) -> str:
             "-c",
             'cli_auth_credentials_store="file"',
             "-c",
-            'model_reasoning_effort="low"'
-            if body.tier == "cheap"
-            else 'model_reasoning_effort="medium"',
+            f'model_reasoning_effort="{body.effort}"',
         ]
         if body.system:
             system_file = scratch / "system.txt"
