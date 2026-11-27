@@ -12,10 +12,10 @@ import re
 import time
 from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from . import admin, alerts, claude, config, gemini, gemini_proxy, openrouter
+from . import admin, alerts, claude, codex_gateway, config, gemini, gemini_proxy, openrouter
 from .access_log import path_access_log
 from .health import register_health
 
@@ -164,6 +164,11 @@ def _active_model(tier: Tier) -> str:
 
 
 # ── routes ───────────────────────────────────────────────────────────────────
+@app.post("/codex", include_in_schema=False)
+async def generate_codex(request: Request) -> Response:
+    return await codex_gateway.generate(request, GenerateIn)
+
+
 @app.post("/generate", dependencies=[Depends(require_key)])
 async def generate(body: GenerateIn, caller: str = Depends(caller_label)) -> dict[str, Any]:
     started = time.monotonic()
