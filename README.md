@@ -158,6 +158,12 @@ publishes the shared listener on `GATEWAY_BIND:8791` over HTTP; that publish is
 not a private HTTPS admin endpoint. A Docker host loopback publish also does
 not restrict peers on a shared Docker network.
 
+## Optional internal Codex route
+
+`POST /codex` is an explicit opt-in for p-agent and agent-mem. It uses
+dedicated gateway keys and a separate worker, without changing existing
+routes or default Docker Compose. See the [operator runbook](docs/codex.md).
+
 ## Alerting
 
 Three failures stop ingestion with no visible error at the caller, so each posts

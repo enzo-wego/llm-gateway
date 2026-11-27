@@ -1,0 +1,1 @@
+"""Private Codex generation worker."""
