@@ -12,14 +12,23 @@ import hmac
 import json
 import logging
 import re
+import sqlite3
 import time
-from typing import Any
+from collections.abc import Callable
+from contextlib import AsyncExitStack
+from dataclasses import dataclass
+from functools import partial
+from typing import Literal, assert_never
 
+import anyio
 import httpx
+from anyio.lowlevel import RunVar
 from fastapi import APIRouter, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
+from starlette.background import BackgroundTask
 
 from . import config, gemini_store as store
+from .gemini_proxy_stream import RelayResponse, close_upstream, read_attempt, stream_response
 
 log = logging.getLogger("llm-gateway.gemini")
 router = APIRouter()
@@ -34,6 +43,8 @@ _RETRYABLE = {429, 500, 502, 503, 504}
 # Tests set this to an httpx.MockTransport / ASGITransport; None means real network.
 transport: httpx.AsyncBaseTransport | None = None
 _rr = 0
+_pool_limiter = RunVar[anyio.CapacityLimiter]("gemini-proxy-pool")
+_log_limiter = RunVar[anyio.CapacityLimiter]("gemini-proxy-log")
 
 
 def client() -> httpx.AsyncClient:
@@ -61,7 +72,7 @@ def _error_reason(body: bytes) -> str:
         return ""
 
 
-def classify(status: int, body: bytes) -> str:
+def classify(status: int, body: bytes) -> Literal["ok", "retry", "rejected", "return"]:
     """ok | retry | rejected | return"""
     if 200 <= status < 300:
         return "ok"
@@ -79,7 +90,7 @@ def _check_caller(request: Request) -> bool:
     return hmac.compare_digest(given.encode(), config.API_KEY.encode())
 
 
-def pick_attempts() -> list[Any]:
+def pick_attempts() -> list[sqlite3.Row]:
     """Round robin over usable keys, at most MAX_ATTEMPTS distinct; one fallback attempt if none."""
     global _rr
     usable = store.usable_keys()
@@ -112,12 +123,47 @@ def _json(status: int, error: str) -> JSONResponse:
 
 
 def _record(route: str, model: str | None, key_id: int | None, status: int, started: float,
-            attempts: int, tokens: tuple[int | None, int | None] = (None, None)) -> None:
-    try:
-        store.log_request(route, model, key_id, status, int((time.monotonic() - started) * 1000),
-                          attempts, tokens[0], tokens[1])
-    except Exception:  # noqa: BLE001 - logging must never break a proxied call
-        log.warning("request_log write failed", exc_info=True)
+            attempts: int, tokens: tuple[int | None, int | None] = (None, None)) -> BackgroundTask:
+    latency = int((time.monotonic() - started) * 1000)
+
+    async def write() -> None:
+        try:
+            await anyio.to_thread.run_sync(
+                store.log_request, route, model, key_id, status, latency, attempts, *tokens,
+                limiter=_worker_limit(_log_limiter, 1),
+            )
+        except (sqlite3.Error, OSError) as exc:
+            log.warning("request_log write failed: %s", type(exc).__name__)
+
+    return BackgroundTask(write)
+
+
+def _worker_limit(state: RunVar[anyio.CapacityLimiter], workers: int) -> anyio.CapacityLimiter:
+    limiter = state.get(None)
+    if limiter is None:
+        limiter = anyio.CapacityLimiter(workers)
+        state.set(limiter)
+    return limiter
+
+
+@dataclass(frozen=True, slots=True)
+class _Call:
+    model: str
+    action: str
+    started: float
+    body: bytes
+    sse: bool
+    content_type: str
+
+    @property
+    def streaming(self) -> bool:
+        return self.action == "streamGenerateContent"
+
+    def record(
+        self, key_id: int | None, status: int, attempts: int,
+        tokens: tuple[int | None, int | None] = (None, None),
+    ) -> BackgroundTask:
+        return _record(self.action, self.model, key_id, status, self.started, attempts, tokens)
 
 
 # ── route ────────────────────────────────────────────────────────────────────
@@ -125,111 +171,120 @@ def _record(route: str, model: str | None, key_id: int | None, status: int, star
 async def proxy(spec: str, request: Request) -> Response:
     started = time.monotonic()
     if not _check_caller(request):
+        response = _json(401, "unauthorized")
         if store.enabled():
-            _record("gemini", None, None, 401, started, 0)
-        return _json(401, "unauthorized")
+            response.background = _record("gemini", None, None, 401, started, 0)
+        return response
     if not store.enabled():
         return _json(503, "gemini_disabled")
 
     model, _, action = spec.rpartition(":")
     if not model or action not in ACTIONS or not _MODEL_RE.match(model):
-        _record("gemini:unknown", None, None, 404, started, 0)
-        return _json(404, "not_found")
+        response = _json(404, "not_found")
+        response.background = _record("gemini:unknown", None, None, 404, started, 0)
+        return response
 
-    attempts_keys = pick_attempts()
+    call = _Call(model, action, started, await request.body(), request.query_params.get("alt") == "sse",
+                 request.headers.get("content-type", "application/json"))
+    if call.streaming:
+        return RelayResponse(partial(_forward, call))
+    async with AsyncExitStack() as resources:
+        return await _forward(call, resources)
+
+
+async def _forward(call: _Call, resources: AsyncExitStack) -> Response:
+    try:
+        return await _try_keys(call, resources)
+    except (sqlite3.OperationalError, OSError) as exc:
+        log.warning("gemini pool unavailable: %s", type(exc).__name__)
+        response = _json(503, "gemini_pool_unavailable")
+        response.background = call.record(None, 503, 0)
+        return response
+
+
+async def _try_keys(call: _Call, resources: AsyncExitStack) -> Response:
+    # Keep proxy key-state operations serialized, independently of telemetry.
+    run_sql = partial(anyio.to_thread.run_sync, limiter=_worker_limit(_pool_limiter, 1))
+    attempts_keys = await run_sql(pick_attempts)
     if not attempts_keys:
-        _record(action, model, None, 503, started, 0)
-        return _json(503, "no_gemini_keys")
+        response = _json(503, "no_gemini_keys")
+        response.background = call.record(None, 503, 0)
+        return response
 
-    body = await request.body()
-    params = {"alt": "sse"} if request.query_params.get("alt") == "sse" else {}
-    url = f"{config.GEMINI_UPSTREAM}/v1beta/models/{model}:{action}"
-    streaming = action == "streamGenerateContent"
-    headers = {"Content-Type": request.headers.get("content-type", "application/json")}
-
+    params = {"alt": "sse"} if call.sse else {}
+    url = f"{config.GEMINI_UPSTREAM}/v1beta/models/{call.model}:{call.action}"
     c = client()
+    resources.push_async_callback(close_upstream, c.aclose)
     last: tuple[int, bytes, httpx.Headers] | None = None
     tried = 0
     key_id: int | None = None
-    try:
-        for row in attempts_keys:
-            tried += 1
-            key_id = row["id"]
-            secret = store.plaintext(row)
-            if secret is None:  # undecryptable (SECRET_KEY changed): out of rotation
-                store.mark_rejected(key_id, "decrypt_failed")
-                last = None
-                continue
-            req = c.build_request("POST", url, params=params, content=body,
-                                  headers={**headers, "x-goog-api-key": secret})
-            try:
-                resp = await c.send(req, stream=streaming)
-            except httpx.HTTPError as e:
-                store.mark_cooldown(key_id, type(e).__name__, None)
-                last = None
-                continue
+    for row in attempts_keys:
+        tried += 1
+        key_id = row["id"]
+        version = row["operator_version"]
+        mark = partial(_mark_key, key_id, version)
+        secret = store.plaintext(row)
+        if secret is None:  # undecryptable (SECRET_KEY changed): out of rotation
+            await mark(store.mark_rejected, "decrypt_failed")
+            last = None
+            continue
+        req = c.build_request("POST", url, params=params, content=call.body,
+                              headers={"Content-Type": call.content_type, "x-goog-api-key": secret})
+        try:
+            resp = await c.send(req, stream=True)
+            data = await read_attempt(resp, call.streaming, resources)
+        except httpx.HTTPError as exc:
+            await mark(store.mark_cooldown, type(exc).__name__, None)
+            last = None
+            continue
 
-            if streaming and 200 <= resp.status_code < 300:
-                store.mark_ok(key_id)
-                return _stream(resp, c, route=action, model=model, key_id=key_id,
-                               started=started, attempts=tried)
+        if isinstance(data, tuple):
+            await mark(store.mark_ok)
+            return stream_response(
+                resp, data, record=partial(call.record, key_id, attempts=tried),
+                cooldown=partial(_stream_cooldown, key_id, version),
+            )
 
-            data = await resp.aread() if streaming else resp.content
-            if streaming:
-                await resp.aclose()
-            verdict = classify(resp.status_code, data)
-            if verdict == "ok":
-                store.mark_ok(key_id)
-                _record(action, model, key_id, resp.status_code, started, tried, _usage(data))
-                await c.aclose()
-                return Response(data, status_code=resp.status_code,
-                                media_type=resp.headers.get("content-type", "application/json"))
-            reason = _error_reason(data)
-            err = f"{resp.status_code} {reason}".strip()
-            if verdict == "retry":
-                store.mark_cooldown(key_id, err, _retry_after(resp.headers))
-            elif verdict == "rejected":
-                store.mark_rejected(key_id, err)
-            else:  # caller error: no key penalty, return as is
-                _record(action, model, key_id, resp.status_code, started, tried)
-                await c.aclose()
-                return Response(data, status_code=resp.status_code,
-                                media_type=resp.headers.get("content-type", "application/json"),
-                                headers=_passthrough_headers(resp.headers))
-            last = (resp.status_code, data, resp.headers)
-    except BaseException:
-        await c.aclose()
-        raise
-    await c.aclose()
+        verdict = classify(resp.status_code, data)
+        if verdict == "ok":
+            await mark(store.mark_ok)
+            return Response(data, status_code=resp.status_code,
+                            media_type=resp.headers.get("content-type", "application/json"),
+                            background=call.record(key_id, resp.status_code, tried, _usage(data)))
+        err = f"{resp.status_code} {_error_reason(data)}".strip()
+        last = (resp.status_code, data, resp.headers)
+        match verdict:
+            case "retry":
+                await mark(store.mark_cooldown, err, _retry_after(resp.headers))
+            case "rejected":
+                await mark(store.mark_rejected, err)
+            case "return":
+                break
+            case unreachable:
+                assert_never(unreachable)
 
     if last is None:
-        _record(action, model, key_id, 502, started, tried)
-        return _json(502, "gemini_upstream_unreachable")
+        response = _json(502, "gemini_upstream_unreachable")
+        response.background = call.record(key_id, 502, tried)
+        return response
     status, data, hdrs = last
-    _record(action, model, key_id, status, started, tried)
     return Response(data, status_code=status,
                     media_type=hdrs.get("content-type", "application/json"),
-                    headers=_passthrough_headers(hdrs))
+                    headers=_passthrough_headers(hdrs), background=call.record(key_id, status, tried))
 
 
-def _stream(resp: httpx.Response, c: httpx.AsyncClient, *, route: str, model: str,
-            key_id: int, started: float, attempts: int) -> StreamingResponse:
-    """Relay chunk by chunk. Past this point an upstream error just ends the stream."""
-    status = resp.status_code
+async def _mark_key(
+    key_id: int, version: int,
+    operation: Callable[..., None | float], *args: str | float | None,
+) -> None:
+    await anyio.to_thread.run_sync(
+        partial(operation, key_id, *args, operator_version=version),
+        limiter=_worker_limit(_pool_limiter, 1),
+    )
 
-    async def gen():
-        final = status
-        try:
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-        except httpx.HTTPError as e:
-            final = 502
-            store.mark_cooldown(key_id, type(e).__name__, None)
-        finally:
-            await resp.aclose()
-            await c.aclose()
-            _record(route, model, key_id, final, started, attempts)
 
-    return StreamingResponse(gen(), status_code=status,
-                             media_type=resp.headers.get("content-type", "text/event-stream"),
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+async def _stream_cooldown(key_id: int, version: int, error: str) -> None:
+    try:
+        await _mark_key(key_id, version, store.mark_cooldown, error, None)
+    except (sqlite3.OperationalError, OSError) as exc:
+        log.warning("gemini stream cooldown write failed: %s", type(exc).__name__)
