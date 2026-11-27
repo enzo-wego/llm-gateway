@@ -23,6 +23,8 @@ _BODY_TIMEOUT_S: Final = 10
 _WORKER_TIMEOUT_S: Final = 180
 _WORKER_URL: Final = "http://codex-worker/generate"  # HTTP target; transport is UDS only.
 _BAD_WORKER_RESPONSE: Final = "invalid Codex worker response"
+_INCOMPLETE_REQUEST: Final = "incomplete Codex request"
+_INVALID_REQUEST: Final = "invalid Codex request"
 _WORKER_UNAVAILABLE: Final = "Codex worker unavailable"
 _WORKER_TIMED_OUT: Final = "Codex worker timed out"
 _WORKER_ERROR_DETAILS: Final = {
@@ -55,13 +57,16 @@ async def _read_request(request: Request, model: type["GenerateIn"]) -> "Generat
                 if len(payload) + len(chunk) > _MAX_BYTES:
                     raise HTTPException(413, "Codex request too large")
                 payload.extend(chunk)
-        return model.model_validate_json(payload)
+        body = model.model_validate_json(payload)
     except TimeoutError:
         raise HTTPException(408, "Codex request timed out") from None
     except ClientDisconnect:
-        raise HTTPException(400, "incomplete Codex request") from None
+        raise HTTPException(400, _INCOMPLETE_REQUEST) from None
     except ValidationError:
-        raise HTTPException(422, "invalid Codex request") from None
+        raise HTTPException(422, _INVALID_REQUEST) from None
+    if not body.user.strip():
+        raise HTTPException(422, _INVALID_REQUEST)
+    return body
 
 
 class _WorkerResult(BaseModel):
@@ -122,6 +127,13 @@ async def _worker_response(socket: Path, payload: bytes) -> bytearray:
     return data
 
 
+async def _cancel_on_disconnect(request: Request, scope: anyio.CancelScope) -> None:
+    """Watch the ASGI receive channel after the request body has been read."""
+    while (await request.receive())["type"] != "http.disconnect":
+        continue
+    scope.cancel()
+
+
 async def generate(request: Request, model: type["GenerateIn"]) -> JSONResponse:
     """Authenticate before reading the request or attempting worker access."""
     _require_service_key(request)
@@ -138,11 +150,25 @@ async def generate(request: Request, model: type["GenerateIn"]) -> JSONResponse:
             separators=(",", ":"),
         ).encode()
     except (ValueError, RecursionError):
-        raise HTTPException(422, "invalid Codex request") from None
+        raise HTTPException(422, _INVALID_REQUEST) from None
     if len(payload) > _MAX_BYTES:
         raise HTTPException(413, "Codex request too large")
 
-    raw = await _worker_response(socket, payload)
+    raw = None
+    failure = None
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(_cancel_on_disconnect, request, tasks.cancel_scope)
+        try:
+            raw = await _worker_response(socket, payload)
+        except HTTPException as exc:
+            # Re-raise outside the group so FastAPI sees the original status.
+            failure = exc
+        finally:
+            tasks.cancel_scope.cancel()
+    if failure is not None:
+        raise failure
+    if raw is None:
+        raise HTTPException(400, _INCOMPLETE_REQUEST)
     result_model = _WorkerText if body.schema_ is None else _WorkerOutput
     try:
         result = result_model.model_validate_json(raw)

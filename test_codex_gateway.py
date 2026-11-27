@@ -201,6 +201,19 @@ def test_bad_requests_are_bounded_and_do_not_reach_worker(
     assert "private" not in response.text
 
 
+@pytest.mark.parametrize("prompt", ["", " \t\n"])
+def test_blank_prompt_is_rejected_before_worker_access(
+    gateway: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, prompt: str
+) -> None:
+    # This path cannot connect; attempting to forward would return 502, not 422.
+    monkeypatch.setenv("CODEX_WORKER_SOCKET", str(tmp_path / "missing.sock"))
+    response = gateway.post(
+        "/codex", json={"user": prompt}, headers={"X-API-Key": _P_KEY}
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid Codex request"}
+
+
 @pytest.mark.parametrize(
     ("status", "payload", "expected_status", "detail"),
     [
