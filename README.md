@@ -66,9 +66,9 @@ curl -fsS "$GW/embed" -H "X-API-Key: $LLM_GATEWAY_API_KEY" \
 `generateContent`, read the answer from `candidates[].content.parts[].text`.
 The proxy also accepts `countTokens`, `embedContent`, `batchEmbedContents`,
 and `streamGenerateContent` (use `?alt=sse` and `curl -N` for streaming).
-Match the model and request body to the action. A `503` with `gemini_disabled`
-or `no_gemini_keys` means the [pool](#optional-gemini-key-pool) is off or
-has no available keys.
+Match the model and request body to the action. On `503`, `gemini_disabled`
+means the [pool](#optional-gemini-key-pool) is off; `no_gemini_keys` means
+it is enabled but has no key to try.
 
 ```sh
 curl -fsS "$GW/gemini/v1beta/models/gemini-2.5-flash:generateContent" \
