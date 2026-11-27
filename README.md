@@ -18,38 +18,70 @@ or Codex route when your application specifically needs that provider.
 
 A **backend** is the integration that handles a request (for example, Claude
 or OpenRouter). A **model ID** or **alias** selects a model in that integration.
-A **tier** is a gateway request field; it is not a model ID. In particular,
-`"tier":"summary"` has different effects on `/generate` and `/codex`.
+A **tier** (`cheap` or `summary`) is a `/generate` request field that selects
+a configured default backend, model, and effort; it is not a model ID and is
+not accepted on `/codex` or `/gemini/*`.
 
-| Route | Where the model is selected | If you omit `tier` | Can a retry change the model? |
+| Route | Where the model and effort are selected | Defaults when omitted | Fallback and override behavior |
 |---|---|---|---|
-| `/generate` | Server maps tier → backend → configured model or alias | Uses `cheap` | A configured Claude → OpenRouter fallback can change the backend and model. |
-| `/gemini/v1beta/models/{model}:{action}` | Caller names the Google model in the URL | No gateway tier exists | Pool failover changes the **API key**, not the requested model or action. |
-| `/codex` | The worker runs Codex CLI without a model override | Uses `cheap` → low reasoning effort | No gateway provider fallback. `summary` requests more effort, not another model. |
+| `/generate` | Server maps `tier` to configured backend, model, and effort; optional per-request `model` and/or `effort` (`low`, `medium`, `high`, `xhigh`, `max`) override the Claude settings | `tier`: `cheap` | With no per-request `model`/`effort`, a configured Claude to OpenRouter fallback can change the backend and model. Setting non-null `model` or `effort` pins Claude (omitting the tier's `thinking` setting), answers `422` if OpenRouter is primary, and answers `503` if the seat is blocked or quota-exhausted. |
+| `/describe` | Uses `BACKEND_DESCRIBE` (`MODEL_CHEAP`/`EFFORT_CHEAP` on Claude, `OR_MODEL_DESCRIBE` on OpenRouter); optional per-request `model` and/or `effort` (`low`, `medium`, `high`, `xhigh`, `max`) override the Claude settings | Configured describe settings | Same as `/generate`: setting non-null `model` or `effort` pins Claude (omitting `THINKING_CHEAP`), answers `422` if OpenRouter is primary, and answers `503` if the seat is blocked or quota-exhausted. |
+| `/gemini/v1beta/models/{model}:{action}` | Caller names the Google model in the URL; for `generateContent` and `streamGenerateContent`, pass effort in the native request body or via optional `?effort=` (`low`, `medium`, `high`) | URL model is required; native body or provider default when `?effort=` is omitted | Pool failover changes the **API key**, never the requested model or action. Non-generation actions (`countTokens`, `embedContent`, `batchEmbedContents`) forward unchanged. |
+| `/codex` | Caller passes optional `model` and/or `effort` (`low`, `medium`, `high`, `xhigh`) in the JSON body (legacy `tier` is rejected with `422`, even if `null`) | `model`: `gpt-6.2-sol`, `effort`: `medium` (independent defaults) | No provider fallback. `meta.model` and `meta.effort` report the requested settings, not provider confirmation. |
 
-### `/generate`: let the gateway choose
+### `/generate` and `/describe`: tier routing or explicit Claude overrides
 
-For `{"tier":"summary","user":"Summarize this incident."}`, the gateway:
+For a legacy tier-routed request (where both `model` and `effort` are omitted
+or `null`), such as `{"tier":"summary","user":"Summarize this incident."}`,
+the gateway:
 
 1. Reads `BACKEND_SUMMARY`. If it is `claude`, it passes `MODEL_SUMMARY`,
-   `EFFORT_SUMMARY`, and the tier's thinking configuration to the Claude SDK.
-   If it is `openrouter`, it sends `OR_MODEL_SUMMARY` to OpenRouter instead.
-   `cheap` follows the same path using the `_CHEAP` settings. Claude effort
-   settings are not forwarded to OpenRouter.
-2. If a Claude call fails with a quota or adapter error, `FALLBACK_ON_QUOTA`
-   controls that request: `true` tries the tier's OpenRouter model; `false`
-   returns the error. A **subsequent** request behaves differently if a prior
-   quota rejection has already marked the seat unavailable: the current handler
-   skips Claude and goes straight to OpenRouter even when the flag is false.
-   Selecting OpenRouter as primary does not set up a reverse fallback to Claude.
-3. Returns `backend` for the integration that actually answered. `meta.model`
-   on a successful generation is the model identifier the adapter requested;
-   if that identifier is an alias, it does not prove the exact provider model
-   version. Adding `schema` changes the answer from `text` to parsed `output`,
-   not the tier or model selection.
+   `EFFORT_SUMMARY`, and the tier's explicit thinking configuration
+   (`THINKING_SUMMARY`, default `adaptive`) to the Claude SDK. If it is
+   `openrouter`, it sends `OR_MODEL_SUMMARY` to OpenRouter instead. `cheap`
+   and `/describe` follow the same path using `_CHEAP` settings (passing
+   `THINKING_CHEAP`, default `disabled`, on the legacy Claude path). Claude
+   effort and thinking settings are not forwarded to OpenRouter.
+2. If a legacy tier-routed Claude call fails with a quota or adapter error,
+   `FALLBACK_ON_QUOTA` controls that request: `true` tries the route's
+   OpenRouter model; `false` returns the error (`503` on quota exhaustion,
+   `502` on a Claude adapter error). A **subsequent** legacy request behaves
+   differently if a prior quota rejection has already marked the seat
+   unavailable: the handler skips Claude and goes straight to OpenRouter even
+   when `FALLBACK_ON_QUOTA` is `false`. Selecting OpenRouter as primary does
+   not set up a reverse fallback to Claude.
+3. If the caller passes a non-null per-request `model` (`sonnet`, `opus`,
+   `haiku`, `fable`, `best`, or `claude-<family-id>`, each with an optional
+   `[1m]` suffix) and/or `effort` (`low`, `medium`, `high`, `xhigh`, `max`) on
+   `/generate` or `/describe`, the request **pins the Claude seat**:
+   - Any omitted `model` or `effort` field still inherits its default from the
+     selected tier on `/generate` (or `MODEL_CHEAP` / `EFFORT_CHEAP` on
+     `/describe`), and `meta.model` and `meta.effort` are included in the
+     response.
+   - **Thinking differs from the legacy path:** instead of passing the tier's
+     configured `THINKING_SUMMARY` or `THINKING_CHEAP` (`thinking={"type": ...}`),
+     an override request passes `thinking=None` (omitting `thinking`) so the
+     Claude CLI uses its model-specific thinking default with the requested
+     `effort` (avoiding a `400` when overriding a `THINKING_CHEAP=disabled`
+     route onto a model that requires adaptive thinking).
+   - **No silent OpenRouter routing or fallback:** if the route's configured
+     primary backend (`BACKEND_SUMMARY`, `BACKEND_CHEAP`, or `BACKEND_DESCRIBE`)
+     is `openrouter`, the gateway rejects the override before calling any
+     provider with HTTP `422` (`"Claude model and effort overrides are unavailable when OpenRouter is primary"`).
+     If the Claude seat is currently blocked by a prior quota rejection, or if
+     the call itself hits `QuotaExhausted`, the gateway returns HTTP `503` even
+     when `FALLBACK_ON_QUOTA=true`. A non-quota `ClaudeError` on an override
+     returns HTTP `502`.
+4. Returns `backend` for the integration that actually answered. `meta.model`
+   on a successful Claude generation is the model identifier the adapter
+   requested; if that identifier is an alias, it does not prove the exact
+   provider model version. Adding `schema` changes the answer from `text` to
+   parsed `output`, not the backend or model selection.
 
-**Mac mini snapshot — November 27, 2026.** These are deployment settings
-observed via `/health` and `/config`, not promises about every installation:
+**Mac mini snapshot (November 27, 2026).** These are the live deployment settings
+observed on the Mac mini via `/health` and `/config` on that date (distinguishing
+what was running live on the host from the per-request override capabilities on
+this branch), not promises about every installation:
 
 | Tier | Primary backend | Claude model / effort | Configured OpenRouter alternative |
 |---|---|---|---|
@@ -58,49 +90,86 @@ observed via `/health` and `/config`, not promises about every installation:
 
 `FALLBACK_ON_QUOTA` was **false** on this mini even though its code default
 is `true`. The OpenRouter entries above are configured alternatives, not the
-primary models. An operator can change the tier mapping
-without changing callers. Clients should send `tier`, not a `model` or
-`backend` field, to `/generate`.
+primary models. An operator can change the tier mapping without changing
+callers. Callers that want operator-managed routing and OpenRouter fallback
+should send `tier` only; callers that send `model` or `effort` on this branch
+explicitly pin Claude for that request.
 
-### `/gemini`: choose the model yourself
+### `/gemini`: URL model plus native body or optional `?effort=`
 
 In `/gemini/v1beta/models/gemini-2.5-flash:generateContent`, the model is
 `gemini-2.5-flash` and the action is `generateContent`. The gateway selects
-a pooled key and posts the caller's body to that same Google model and action.
-If that key is rate-limited or rejected, it can try another key; it does not
-switch from Flash to Pro, reinterpret the body as a gateway tier, or send
-the request to OpenRouter. To choose another model, change the **URL** to an
-ID that supports the action and is available to your pooled keys.
+a pooled key and forwards the request to that exact Google model and action.
+If that key is rate-limited or rejected, the proxy can try another pooled key;
+it never switches models, reinterprets the body as a gateway tier, or falls
+back to OpenRouter. To choose another model, change the **URL** to a model ID
+that supports the action and is available to your pooled keys.
 
-For the same incident summary, send
-`{"contents":[{"parts":[{"text":"Summarize this incident."}]}]}` to the URL
-above. To count tokens rather than generate, leave the model ID in place and
-change the suffix to `:countTokens`. The response is Google's native JSON:
-look for `candidates` on a generation or `totalTokens` on a count. If Google
-includes `modelVersion` in a generation response, it is passed through;
-there is no gateway `meta.model` wrapper. The separate `/embed` route does
-not use this URL-based model selection or the pooled credentials.
+For `generateContent` and `streamGenerateContent` (including `?alt=sse`), you
+can control reasoning effort either in the native Google JSON payload (under
+`generationConfig.thinkingConfig`) or with the optional `?effort=low|medium|high`
+query shortcut (combinable with `alt=sse` as `?alt=sse&effort=low`). When
+`?effort=` is omitted, the gateway forwards the request body bytes unchanged.
+When `?effort=` is present, the gateway merges the translated setting into
+`generationConfig.thinkingConfig` (preserving an existing boolean
+`includeThoughts` / `include_thoughts` field) according to this gateway policy
+table:
 
-### `/codex`: choose effort, not a GPT model
+| Exact URL `{model}` ID | `?effort=` translation in `thinkingConfig` | `low` | `medium` | `high` |
+|---|---|---|---|---|
+| `gemini-2.5-flash` | `thinkingBudget` (gateway policy token budget) | `256` | `4096` | `16384` |
+| `gemini-2.5-flash-lite` | `thinkingBudget` (gateway policy token budget) | `512` | `4096` | `16384` |
+| `gemini-2.5-pro` | `thinkingBudget` (gateway policy token budget) | `1024` | `8192` | `24576` |
+| `gemini-3-pro-preview` | `thinkingLevel` | `"LOW"` | Rejected (`400 unsupported_effort_level`) | `"HIGH"` |
+| `gemini-3-flash-preview`, `gemini-3.1-pro-preview`, `gemini-3.1-pro-preview-customtools`, `gemini-3.1-flash-lite`, `gemini-3.5-flash-lite`, `gemini-3.6-flash`, `gemini-3.8-flash` | `thinkingLevel` | `"LOW"` | `"MEDIUM"` | `"HIGH"` |
 
-Send `{"tier":"summary","user":"Summarize this incident."}` to `/codex`
-with your project's **dedicated** `X-API-Key`. The gateway authenticates the
-project and sends the request over a private socket to the worker. The worker
-starts a fresh `codex exec` with these settings:
+The `thinkingBudget` integers above are gateway policy mappings for the
+`?effort=` shortcut, not Google-mandated constants; pass native
+`thinkingConfig` fields directly (without `?effort=`) when you need a custom
+budget or use another model ID. Model matching for `?effort=` is exact (aliases
+and unlisted variants do not inherit table entries). The gateway returns HTTP
+`400` before contacting upstream if `?effort=` is used on a non-generation
+action (`unsupported_effort_action`), an unlisted model
+(`unsupported_effort_model`), an unsupported level such as `medium` on
+`gemini-3-pro-preview` (`unsupported_effort_level`), or when the JSON body
+already contains `thinkingBudget` / `thinking_budget` / `thinkingLevel` /
+`thinking_level` (`conflicting_thinking_config`). For the incident summary
+example, send the native payload shape
+`{"contents":[{"parts":[{"text":"Summarize this incident."}]}]}` to
+`:generateContent` or `:streamGenerateContent?alt=sse`.
 
-| Request | Worker setting | Model argument |
+Non-generation actions (`:countTokens`, `:embedContent`, `:batchEmbedContents`)
+are unchanged: keep the model ID in the URL, swap the action suffix, and send
+the native request body. The response is always Google's native payload
+(such as `candidates` on generation, SSE `data:` chunks on
+`streamGenerateContent?alt=sse`, or `totalTokens` on `countTokens`) without a
+gateway `meta` wrapper. The separate `/embed` route does not use this
+URL-based model selection or the pooled credentials.
+
+### `/codex`: explicit optional `model` and `effort`
+
+Send `{"user":"Summarize this incident."}` (with optional `model` and `effort`)
+to `/codex` using your project's **dedicated** `X-API-Key`. The gateway
+authenticates the project and forwards the validated request over a private
+Unix socket to the worker. `model` and `effort` have independent defaults:
+
+| Field | When omitted | Supported values |
 |---|---|---|
-| Omit `tier`, or send `"tier":"cheap"` | `model_reasoning_effort="low"` | No `--model` |
-| Send `"tier":"summary"` | `model_reasoning_effort="medium"` | No `--model` |
+| `model` | `gpt-6.2-sol` | Explicit Codex model ID (default `gpt-6.2-sol`) |
+| `effort` | `medium` | `low`, `medium`, `high`, `xhigh` |
 
-The CLI uses its default model under the worker's authenticated identity.
-The worker also passes `--ignore-user-config`, so editing a developer's local
-Codex config is not a way to pin this route. The gateway does not expose a
-per-request `model` override. A successful reply identifies `backend: "codex"`
-and returns `text` or `output`; the current worker returns `meta: {}`. **You
-cannot infer an exact GPT model ID from that response or from the tier.**
-If your application must audit or pin a specific model, the worker needs
-explicit model configuration and reporting before this route meets that need.
+Legacy `tier` requests are rejected on `/codex` with HTTP `422`, even when
+sent as `"tier": null`. Migrate existing callers from `"tier":"cheap"` to
+`"effort":"low"`, and from `"tier":"summary"` to `"effort":"medium"` (or omit
+`effort` to use the `medium` default). Because `model` and `effort` are
+independent, you can pass either field alone or both together.
+
+The worker passes `--ignore-user-config` and runs `codex exec` with the
+requested `--model` and `model_reasoning_effort`. A successful reply returns
+`backend: "codex"`, `text` or parsed `output`, and `meta` containing
+`meta.model` and `meta.effort`. Those `meta` fields echo the settings requested
+by the caller (or the gateway defaults), not upstream provider confirmation of
+the executed model or reasoning effort.
 
 ### Check your deployment without calling a model
 
@@ -115,8 +184,7 @@ curl -fsS "$GW/config" -H "X-API-Key: $LLM_GATEWAY_API_KEY" |
 
 `/health` shows the configured primary model for each core route, not which
 provider served a particular request. For that, inspect the generation
-response's `backend`. Neither diagnostic resolves the Codex CLI's default
-model or inventories the Google models accessible to each pool key.
+response's `backend` and `meta`.
 
 ## Caller examples
 
@@ -131,31 +199,41 @@ GW="${GW:-http://127.0.0.1:8750}"
 curl -fsS "$GW/health"
 ```
 
-**Claude or OpenRouter — generate.** Pick `cheap` or `summary`; there is no
-per-request provider switch. For example, `LLM_GATEWAY_BACKEND_CHEAP=openrouter`
-on the server routes `cheap` requests to OpenRouter. The same request works on
-a Claude tier. Check `backend` in the response to see which actually answered,
-including after fallback. This example requests JSON text; to get parsed
-`output` instead, pass a nonempty `schema` as in the Codex example below.
+**Claude or OpenRouter: generate (tier-routed or Claude-pinned).** Pick `cheap`
+or `summary` when you want the server's configured backend and quota fallback.
+Pass optional `model` and/or `effort` (`low`, `medium`, `high`, `xhigh`, `max`)
+to pin the request to the Claude seat (omitting the tier's `thinking` mode,
+returning `422` if OpenRouter is primary or `503` if the seat is unavailable,
+with no silent OpenRouter fallback). Check `backend` and `meta` in the response
+to see what answered. To get parsed `output` instead of `text`, pass a nonempty
+`schema` as in the Codex example below.
 
 ```sh
+# Tier-routed (uses configured backend for cheap, with fallback if enabled)
 curl -fsS "$GW/generate" -H "X-API-Key: $LLM_GATEWAY_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"tier":"cheap","user":"Return a JSON object with a short greeting."}'
+
+# Explicit override (pins Claude with model="sonnet" and effort="high", no OpenRouter fallback)
+curl -fsS "$GW/generate" -H "X-API-Key: $LLM_GATEWAY_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"user":"Summarize the root cause.","model":"sonnet","effort":"high"}'
 ```
 
-**Claude or OpenRouter — describe a file.** Supply the MIME type and raw
-base64 (no `data:` prefix). This example uses `jq` and a local `receipt.png`;
-for a PDF, change the filename and MIME type to `application/pdf`.
+**Claude or OpenRouter: describe a file.** Supply the MIME type and raw
+base64 (no `data:` prefix). Like `/generate`, optional `model` and/or `effort`
+pin the request to Claude without OpenRouter fallback. This example uses `jq`
+and a local `receipt.png`; for a PDF, change the filename and MIME type to
+`application/pdf`.
 
 ```sh
 base64 < receipt.png | tr -d '\r\n' | jq -Rs \
-  '{mime:"image/png",data_b64:.,prompt:"Extract the total as JSON."}' |
+  '{mime:"image/png",data_b64:.,prompt:"Extract the total as JSON.",effort:"low"}' |
   curl -fsS "$GW/describe" -H "X-API-Key: $LLM_GATEWAY_API_KEY" \
     -H 'Content-Type: application/json' --data-binary @-
 ```
 
-**OpenRouter — embed.** Set `dims` to the width of your vector index. Use
+**OpenRouter: embed.** Set `dims` to the width of your vector index. Use
 `"fallback":false` if a request must stay on OpenRouter. Otherwise the gateway
 may use its separate `GEMINI_API_KEY` when OpenRouter hits its monthly cap;
 this fallback does **not** draw from the Gemini proxy pool.
@@ -166,46 +244,63 @@ curl -fsS "$GW/embed" -H "X-API-Key: $LLM_GATEWAY_API_KEY" \
   -d '{"texts":["payment received","invoice overdue"],"dims":768,"fallback":false}'
 ```
 
-**Gemini — native API.** Put the Google model ID in the path. For
-`generateContent`, read the answer from `candidates[].content.parts[].text`.
-The proxy also accepts `countTokens`, `embedContent`, `batchEmbedContents`,
-and `streamGenerateContent` (use `?alt=sse` and `curl -N` for streaming).
-Match the model and request body to the action. On `503`, `gemini_disabled`
+**Gemini: native API (unary and SSE streaming).** Put the Google model ID in
+the path and send Google's native JSON payload shape (`contents`, optional
+`generationConfig`, and related fields). For `generateContent` and
+`streamGenerateContent`, pass reasoning effort in the native body or via
+optional `?effort=low|medium|high`; use `?alt=sse` (or `?alt=sse&effort=low`)
+and `curl -N` for SSE streaming. The proxy also accepts `countTokens`,
+`embedContent`, and `batchEmbedContents` unchanged. On `503`, `gemini_disabled`
 means the [pool](#optional-gemini-key-pool) is off; `no_gemini_keys` means
 it is enabled but has no key to try.
 
 ```sh
-curl -fsS "$GW/gemini/v1beta/models/gemini-2.5-flash:generateContent" \
+# Unary generateContent with optional ?effort=
+curl -fsS "$GW/gemini/v1beta/models/gemini-2.5-flash:generateContent?effort=low" \
   -H "x-goog-api-key: $LLM_GATEWAY_API_KEY" -H 'Content-Type: application/json' \
   -d '{"contents":[{"parts":[{"text":"Reply with a short greeting."}]}]}'
+
+# Streaming streamGenerateContent with alt=sse and optional effort
+curl -fsSN "$GW/gemini/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&effort=medium" \
+  -H "x-goog-api-key: $LLM_GATEWAY_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"contents":[{"parts":[{"text":"Stream a two-sentence summary."}]}]}'
 ```
 
-**Codex — internal projects only.** Use the secret issued to `p-agent` or
-`agent-mem` as `CODEX_PROJECT_KEY`, **not** the shared gateway key. The example
-returns `backend: "codex"` and a parsed `output` object; omit `schema` for
-`text`. Codex does not fall back to another provider. See the
-[Codex runbook](docs/codex.md) for provisioning and error responses.
+**Codex: internal projects only.** Use the secret issued to `p-agent` or
+`agent-mem` as `CODEX_PROJECT_KEY`, **not** the shared gateway key. `model`
+defaults to `gpt-6.2-sol` and `effort` (`low`, `medium`, `high`, `xhigh`)
+defaults to `medium` independently; legacy `tier` is rejected (`422`), even
+when `null`. The response returns `backend: "codex"`, `text` or parsed
+`output`, and `meta.model` / `meta.effort` (which report the requested
+settings, not provider confirmation). Codex does not fall back to another
+provider. See the [Codex runbook](docs/codex.md) for provisioning, migration
+from `tier`, and error responses.
 
 ```sh
 curl -fsS --max-time 200 "$GW/codex" -H "X-API-Key: $CODEX_PROJECT_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"user":"Report status OK.","schema":{"type":"object","properties":{"status":{"type":"string","enum":["OK"]}},"required":["status"],"additionalProperties":false}}'
+  -d '{"user":"Report status OK.","model":"gpt-6.2-sol","effort":"low","schema":{"type":"object","properties":{"status":{"type":"string","enum":["OK"]}},"required":["status"],"additionalProperties":false}}'
 ```
 
 ## Endpoints
 
-These shared-key routes require `X-API-Key`, except for public `/health`.
-The provider-specific Gemini and Codex routes use the credentials listed above.
+`/generate`, `/describe`, `/embed`, `/usage`, and `/config` require the shared
+`X-API-Key: $LLM_GATEWAY_API_KEY`; `/health` is unauthenticated. `/gemini/*`
+accepts `$LLM_GATEWAY_API_KEY` in `x-goog-api-key` (or `X-API-Key`), while
+`/codex` requires the calling project's dedicated `CODEX_P_AGENT_KEY` or
+`CODEX_AGENT_MEM_KEY` in `X-API-Key` (and rejects the shared gateway key).
 
 | Route | Backend | Body |
 |---|---|---|
-| `POST /generate` | seat or OpenRouter | `{system?, user, tier?: "summary"\|"cheap", schema?}`; default tier: `cheap` |
-| `POST /describe` | seat or OpenRouter | `{system, prompt, mime, data_b64, schema?}` |
+| `POST /generate` | seat or OpenRouter (pinned to seat if `model` or `effort` is set; `422` if OpenRouter is primary, `503` if seat unavailable) | `{system?, user, tier?: "summary"\|"cheap", model?, effort?: "low"\|"medium"\|"high"\|"xhigh"\|"max", schema?}`; default tier: `cheap` |
+| `POST /describe` | seat or OpenRouter (pinned to seat if `model` or `effort` is set; `422` if OpenRouter is primary, `503` if seat unavailable) | `{system?, prompt, mime, data_b64, model?, effort?: "low"\|"medium"\|"high"\|"xhigh"\|"max", schema?}` |
 | `POST /embed` | OpenRouter, then Gemini on cap exhaustion | `{texts: [...], dims, fallback?}` (`fallback` defaults to `true`; `false` disables Gemini fallback for that request) |
-| `GET /config` | — | current editable, non-secret runtime configuration |
-| `PUT /config` | — | partial configuration update, applied live and persisted to `.env` |
-| `GET /health` | — | gateway liveness, quota state, counters, active backends, and optional pool readiness |
-| `GET /usage` | — | seat and OpenRouter budget, plus per-caller `callers` counters |
+| `POST /gemini/v1beta/models/{model}:{action}` | Gemini key pool | Native Google JSON body (`{contents: [...], ...}`); optional `?effort=low\|medium\|high` shortcut on `generateContent` and `streamGenerateContent` (plus `?alt=sse` for SSE) |
+| `POST /codex` | Dedicated Codex worker | `{system?, user, model?, effort?: "low"\|"medium"\|"high"\|"xhigh", schema?}`; independent defaults `model: "gpt-6.2-sol"`, `effort: "medium"` (`tier` rejected, even `null`) |
+| `GET /config` | - | current editable, non-secret runtime configuration |
+| `PUT /config` | - | partial configuration update, applied live and persisted to `.env` |
+| `GET /health` | - | gateway liveness, quota state, counters, active backends, and optional pool readiness |
+| `GET /usage` | - | seat and OpenRouter budget, plus per-caller `callers` counters |
 
 The Gemini fallback retries HTTP 429, 500, 502, 503, 504 and network errors up
 to 3 times (1, 2, 4 s, or `Retry-After` up to 10 s for 429 and 503) before
@@ -235,13 +330,19 @@ are not counted. Counters reset on process restart.
 document, so it reads the text layer rather than a rasterized page.
 
 Pass a JSON Schema as `schema` and the response contains a parsed `output`
-object. Omit it and you get raw `text` back. This holds on **both** backends —
-before, the OpenRouter path accepted `schema` and ignored it, so a backend
-switch or a quota fallback changed the response shape with nothing in the
-response saying so.
+object. Omit it and you get raw `text` back. This holds on **both** backends,
+whereas earlier versions of the OpenRouter path accepted `schema` and ignored
+it, so a backend switch or a quota fallback changed the response shape with
+nothing in the response saying so.
 
-On `/generate`, callers pick a **tier**, not a model name. The native Gemini
-route is different: the caller names the model in the URL.
+On `/generate`, callers can send `tier` alone to use the operator-configured
+backend and tier thinking mode (`THINKING_SUMMARY` or `THINKING_CHEAP`), or
+pass non-null `model` and/or `effort` on `/generate` or `/describe` to pin the
+Claude seat and let the Claude CLI use its model-specific thinking default.
+The native Gemini route requires the Google model ID in the URL (with native
+`thinkingConfig` or the optional `?effort=` shortcut on generation and
+streaming), while `/codex` accepts optional `model` and `effort` in the JSON
+body.
 
 Tier models default to the CLI aliases `sonnet` and `haiku`, which resolve to
 the newest model in each family. The CLI that resolves them ships inside
@@ -262,8 +363,11 @@ must not move. A full id needs a CLI that knows it: CLI 2.1.283 rejects
 The refresh only moves the Claude backend. A tier on `openrouter` calls
 `OR_MODEL_*`, and OpenRouter's floating aliases (`~anthropic/claude-sonnet-latest`,
 `~anthropic/claude-haiku-latest`, `~anthropic/claude-opus-latest`) resolve
-server side with no rebuild. A new model that rejects the configured `THINKING_*` mode fails
-with a 400 until the pin or the mode changes.
+server side with no rebuild. On the legacy tier path (no per-request `model` or
+`effort` override), a new tier model that rejects the configured `THINKING_*`
+mode fails with a 400 until the pin or the mode changes; per-request Claude
+overrides omit `THINKING_*` and defer to the CLI's model-specific thinking
+default.
 
 `GET /config` and `PUT /config` require `X-API-Key`. The config response never
 contains service or provider credentials. Updates reject unknown keys and
