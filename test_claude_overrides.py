@@ -49,6 +49,21 @@ def _body(route: Route) -> dict[str, str]:
     return {"prompt": "Read this", "mime": "image/png", "data_b64": "QQ=="}
 
 
+def test_family_rejection_does_not_block_other_models(gateway, monkeypatch):
+    sdk_call = AsyncMock(side_effect=[
+        claude.QuotaExhausted("seven_day_opus", 4_000_000_000),
+        {"text": "ok", "meta": {}}, {"text": "ok", "meta": {}},
+    ])
+    monkeypatch.setattr(claude, "_guarded", sdk_call)
+    for model, expected in (("opus", 503), ("claude-opus-4-1", 503), ("haiku", 200), (None, 200)):
+        body = {"user": "ok", **({"model": model} if model else {})}
+        result = gateway.post("/generate", json=body)
+        assert result.status_code == expected
+        if expected == 200:
+            assert result.json()["backend"] == "claude"
+    assert sdk_call.await_count == 3
+
+
 @pytest.mark.parametrize(
     ("overrides", "model", "effort", "structured"),
     [

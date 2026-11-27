@@ -2776,6 +2776,19 @@ def patched_sdk_client(cls):
 _RUN_OPTS = SimpleNamespace(model="m")
 
 
+def test_sdk_404_without_errors_is_classified():
+    msg = ResultMessage(is_error=True)
+    msg.api_error_status = 404
+    cls, _ = _fake_sdk_client([msg])
+    with patched_sdk_client(cls):
+        try:
+            asyncio.run(claude._run("p", _RUN_OPTS))
+        except claude.ClaudeError as exc:
+            assert str(exc) == "Claude model unavailable (404)"
+        else:
+            raise AssertionError("missing model returned success")
+
+
 def test_run_hook_closes_streak_only_after_auth_was_accepted() -> None:
     cases = [
         ("text", [AssistantMessage("hi"), ResultMessage()], None, True),

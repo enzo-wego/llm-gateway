@@ -33,6 +33,11 @@ log = logging.getLogger("llm-gateway.claude")
 class QuotaExhausted(RuntimeError):
     """The seat's rolling window is spent. Caller may fall back to OpenRouter."""
 
+    def __init__(self, window: str = "quota", resets_at: int | None = None):
+        super().__init__(window)
+        self.window = window
+        self.resets_at = resets_at
+
 
 class ClaudeError(RuntimeError):
     """Terminal, non-quota failure (auth expired, billing, CLI crash)."""
@@ -140,7 +145,7 @@ async def _run(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, Any]:
     text_parts: list[str] = []
     meta: dict[str, Any] = {}
     fatal: str | None = None
-    quota_rejected = False
+    rejection: QuotaExhausted | None = None
 
     async with _query_slots:
         client = sdk.ClaudeSDKClient(options)
@@ -175,7 +180,8 @@ async def _run(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, Any]:
                         "resets_at": getattr(info, "resets_at", None),
                     }
                     if getattr(info, "status", None) == "rejected":
-                        quota_rejected = True
+                        rejection = QuotaExhausted(meta["rate_limit"]["type"] or "quota",
+                                                   meta["rate_limit"]["resets_at"])
                     await alerts.on_rate_limit(info)
 
                 elif kind == "AssistantMessage":
@@ -197,16 +203,18 @@ async def _run(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, Any]:
                         model=options.model,
                     )
                     if msg.is_error:
-                        fatal = fatal or (
-                            msg.errors[0] if msg.errors else "unknown_error"
-                        )
+                        status = getattr(msg, "api_error_status", None)
+                        classification = ("Claude model unavailable (404)" if status == 404
+                                          else f"Claude API error ({status})" if isinstance(status, int)
+                                          else "unknown_error")
+                        fatal = fatal or (msg.errors[0] if msg.errors else classification)
         finally:
             # Release the semaphore only after the CLI has been reaped, even
             # when raw asyncio cancellation arrives during disconnect().
             await _disconnect(client)
 
-    if quota_rejected:
-        raise QuotaExhausted(meta.get("rate_limit", {}).get("type") or "quota")
+    if rejection is not None:
+        raise rejection
     if fatal:
         raise ClaudeError(fatal)
     alerts.on_claude_ok()

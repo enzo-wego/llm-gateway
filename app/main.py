@@ -32,18 +32,25 @@ class _Quota:
 
     def __init__(self) -> None:
         self.blocked_until: float = 0.0
+        self.family_blocks: dict[str, float] = {}
         self.last: dict[str, Any] | None = None
         self.calls = 0
         self.cost_usd = 0.0
         self.fallbacks = 0
 
-    def seat_available(self) -> bool:
-        return time.time() >= self.blocked_until
+    def seat_available(self, model: str = "") -> bool:
+        parts = model.removesuffix("[1m]").split("-")
+        deadline = max((self.family_blocks.get(part, 0.0) for part in parts), default=0.0)
+        return time.time() >= max(self.blocked_until, deadline)
 
-    def note_rejection(self, resets_at: int | None) -> None:
+    def note_rejection(self, resets_at: int | None, window: str = "") -> None:
         # Trust the reported reset; if absent, back off 15 minutes so a
         # missing timestamp can't wedge the seat off permanently.
-        self.blocked_until = float(resets_at) if resets_at else time.time() + 900
+        deadline = float(resets_at) if resets_at else time.time() + 900
+        if window in {"seven_day_opus", "seven_day_sonnet", "seven_day_haiku", "seven_day_fable"}:
+            self.family_blocks[window.removeprefix("seven_day_")] = deadline
+        else:
+            self.blocked_until = deadline
 
     def record(self, meta: dict[str, Any]) -> None:
         self.calls += 1
@@ -177,7 +184,7 @@ async def generate(body: GenerateIn, caller: str = Depends(caller_label)) -> dic
     cost = 0.0
 
     try:
-        seat_available = backend == "claude" and quota.seat_available()
+        seat_available = backend == "claude" and quota.seat_available(cmodel)
         body.require_available_seat(backend=backend, seat_available=seat_available)
         if seat_available:
             try:
@@ -194,7 +201,7 @@ async def generate(body: GenerateIn, caller: str = Depends(caller_label)) -> dic
                 return {"backend": "claude", **res}
             except claude.QuotaExhausted as e:
                 reason = "quota_exhausted"
-                quota.note_rejection((quota.last or {}).get("resets_at"))
+                quota.note_rejection(e.resets_at, e.window)
                 if body.explicit or not config.FALLBACK_ON_QUOTA:
                     status = 503
                     raise HTTPException(503, f"seat quota exhausted ({e})") from e
@@ -250,7 +257,7 @@ async def describe(body: DescribeIn, caller: str = Depends(caller_label)) -> dic
     cost = 0.0
 
     try:
-        seat_available = backend == "claude" and quota.seat_available()
+        seat_available = backend == "claude" and quota.seat_available(cmodel)
         body.require_available_seat(backend=backend, seat_available=seat_available)
         if seat_available:
             try:
@@ -268,7 +275,7 @@ async def describe(body: DescribeIn, caller: str = Depends(caller_label)) -> dic
                 return {"backend": "claude", **res}
             except claude.QuotaExhausted as e:
                 reason = "quota_exhausted"
-                quota.note_rejection((quota.last or {}).get("resets_at"))
+                quota.note_rejection(e.resets_at, e.window)
                 if body.explicit or not config.FALLBACK_ON_QUOTA:
                     status = 503
                     raise HTTPException(503, f"seat quota exhausted ({e})") from e
