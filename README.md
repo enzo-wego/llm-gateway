@@ -4,6 +4,25 @@ One HTTP gateway for Claude, OpenRouter, Google Gemini, and OpenAI Codex.
 Use `/generate` when you want the gateway to choose a backend. Use the Gemini
 or Codex route when your application specifically needs that provider.
 
+## Mac mini deployment check
+
+Verified **November 27, 2026, at 18:20 UTC** on the deployed gateway and
+Codex worker, built from `main` at `9cb4759` (PR #31).
+
+| Live request | Observed result |
+|---|---|
+| `POST /codex`, `p-agent` credential, prompt only | `200`; text `OK`; metadata reported the defaults `gpt-6.2-sol` and `medium`. |
+| `POST /codex`, `agent-mem` credential, explicit `gpt-6.2-sol`, `low`, and a JSON schema | `200`; parsed `output` was `{"status":"OK"}`; metadata reported `gpt-6.2-sol` and `low`. |
+| `POST /codex` with the retired `tier` field | `422`; callers must remove `tier`. |
+| `POST /generate` with `model: "sonnet"` and an invalid effort | `422` at request validation. |
+| Gemini `:countTokens?effort=medium` | `400`; the effort shortcut is only available for generation and streaming. |
+
+The two successful Codex requests used the worker's Wego ChatGPT sign-in.
+Claude and Gemini **inference was not exercised** in this smoke test. The
+gateway reported healthy and the pool reported six healthy Gemini keys;
+the separate `GEMINI_API_KEY` fallback credential was absent. The tested
+release also passed 291 automated tests before deployment.
+
 ## Choose a provider
 
 | I want to… | Route | Caller credential | What comes back |
@@ -92,7 +111,7 @@ this branch), not promises about every installation:
 is `true`. The OpenRouter entries above are configured alternatives, not the
 primary models. An operator can change the tier mapping without changing
 callers. Callers that want operator-managed routing and OpenRouter fallback
-should send `tier` only; callers that send `model` or `effort` on this branch
+should send `tier` only; callers that send `model` or `effort` on `/generate`
 explicitly pin Claude for that request.
 
 ### `/gemini`: URL model plus native body or optional `?effort=`
