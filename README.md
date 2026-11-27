@@ -1,39 +1,97 @@
 # llm-gateway
 
-One HTTP surface in front of three LLM backends, so callers ask for an *intent*
-and this service decides which model and provider serves it.
+One HTTP gateway for Claude, OpenRouter, Google Gemini, and OpenAI Codex.
+Use `/generate` when you want the gateway to choose a backend. Use the Gemini
+or Codex route when your application specifically needs that provider.
 
-Built for `agent-mem`, but nothing in here is agent-mem-specific.
+## Choose a provider
 
+| I want to… | Route | Caller credential | What comes back |
+|---|---|---|---|
+| Generate text or JSON with Claude or OpenRouter | `POST /generate` | `X-API-Key: $LLM_GATEWAY_API_KEY` | `backend` (`claude` or `openrouter`), `text` or `output`, `meta` |
+| Describe an image or PDF with Claude or OpenRouter | `POST /describe` | Same gateway key | Same shape as `/generate` |
+| Embed text for vector search | `POST /embed` | Same gateway key | `embeddings` in input order; OpenRouter first, direct Gemini on cap exhaustion if enabled |
+| Call a Gemini model directly through the key pool | `POST /gemini/v1beta/models/{model}:{action}` | `x-goog-api-key: $LLM_GATEWAY_API_KEY` | Gemini's native response, not the gateway `text` wrapper |
+| Generate text or JSON with Codex | `POST /codex` | `X-API-Key` with the calling project's **dedicated Codex key** | `backend: "codex"`, `text` or `output`, `meta` |
+
+### Caller examples
+
+Run these on the gateway host, or set `GW` to the gateway address reachable
+from your application. Inside another container, `127.0.0.1` refers to that
+container, not the gateway. Have your secret store supply `LLM_GATEWAY_API_KEY`
+for the shared routes or `CODEX_PROJECT_KEY` for Codex. Clients do **not**
+need a Claude login, an OpenRouter key, a Google key, or the pool encryption secret.
+
+```sh
+GW="${GW:-http://127.0.0.1:8750}"
+curl -fsS "$GW/health"
 ```
-caller ──HTTP──▶ llm-gateway ──▶ Claude (subscription seat, via bundled CLI)
-                             ├──▶ OpenRouter (primary embeddings, fallback generation)
-                             └──▶ Gemini API (embeddings when OpenRouter's cap is spent)
+
+**Claude or OpenRouter — generate.** Pick `cheap` or `summary`; there is no
+per-request provider switch. For example, `LLM_GATEWAY_BACKEND_CHEAP=openrouter`
+on the server routes `cheap` requests to OpenRouter. The same request works on
+a Claude tier. Check `backend` in the response to see which actually answered,
+including after fallback. This example requests JSON text; to get parsed
+`output` instead, pass a nonempty `schema` as in the Codex example below.
+
+```sh
+curl -fsS "$GW/generate" -H "X-API-Key: $LLM_GATEWAY_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"tier":"cheap","user":"Return a JSON object with a short greeting."}'
 ```
 
-## Why two backends
+**Claude or OpenRouter — describe a file.** Supply the MIME type and raw
+base64 (no `data:` prefix). This example uses `jq` and a local `receipt.png`;
+for a PDF, change the filename and MIME type to `application/pdf`.
 
-They do different jobs and neither can do the other's.
+```sh
+base64 < receipt.png | tr -d '\r\n' | jq -Rs \
+  '{mime:"image/png",data_b64:.,prompt:"Extract the total as JSON."}' |
+  curl -fsS "$GW/describe" -H "X-API-Key: $LLM_GATEWAY_API_KEY" \
+    -H 'Content-Type: application/json' --data-binary @-
+```
 
-**Generation** — Claude reads a Slack thread and *writes* a summary, or looks at
-a screenshot and *describes* it. Output is prose, stored in `TEXT` columns.
+**OpenRouter — embed.** Set `dims` to the width of your vector index. Use
+`"fallback":false` if a request must stay on OpenRouter. Otherwise the gateway
+may use its separate `GEMINI_API_KEY` when OpenRouter hits its monthly cap;
+this fallback does **not** draw from the Gemini proxy pool.
 
-**Embedding** — `gemini-embedding-001` writes nothing. It turns text into 3,072
-numbers positioned so similar meanings sit close together. Output is a vector,
-stored in `halfvec`/`vector` columns behind an HNSW index, and it is what
-semantic search actually queries.
+```sh
+curl -fsS "$GW/embed" -H "X-API-Key: $LLM_GATEWAY_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"texts":["payment received","invoice overdue"],"dims":768,"fallback":false}'
+```
 
-They run in sequence, not as alternatives: Claude writes a summary, then that
-summary is embedded, and both land in the same database row.
+**Gemini — native API.** Put the Google model ID in the path. For
+`generateContent`, read the answer from `candidates[].content.parts[].text`.
+The proxy also accepts `countTokens`, `embedContent`, `batchEmbedContents`,
+and `streamGenerateContent` (use `?alt=sse` and `curl -N` for streaming).
+Match the model and request body to the action. A `503` with `gemini_disabled`
+or `no_gemini_keys` means the [pool](#optional-gemini-key-pool) is off or
+has no available keys.
 
-**Embeddings can never move to Claude.** Anthropic has no embeddings API — no
-Claude model returns a vector. Even if one shipped, a query vector is only
-comparable to stored vectors from the same model, so switching would mean
-recomputing every stored vector and would silently degrade search until you did.
+```sh
+curl -fsS "$GW/gemini/v1beta/models/gemini-2.5-flash:generateContent" \
+  -H "x-goog-api-key: $LLM_GATEWAY_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"contents":[{"parts":[{"text":"Reply with a short greeting."}]}]}'
+```
+
+**Codex — internal projects only.** Use the secret issued to `p-agent` or
+`agent-mem` as `CODEX_PROJECT_KEY`, **not** the shared gateway key. The example
+returns `backend: "codex"` and a parsed `output` object; omit `schema` for
+`text`. Codex does not fall back to another provider. See the
+[Codex runbook](docs/codex.md) for provisioning and error responses.
+
+```sh
+curl -fsS --max-time 200 "$GW/codex" -H "X-API-Key: $CODEX_PROJECT_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"user":"Report status OK.","schema":{"type":"object","properties":{"status":{"type":"string","enum":["OK"]}},"required":["status"],"additionalProperties":false}}'
+```
 
 ## Endpoints
 
-The core routes below require `X-API-Key`, except for `/health`.
+These shared-key routes require `X-API-Key`, except for public `/health`.
+The provider-specific Gemini and Codex routes use the credentials listed above.
 
 | Route | Backend | Body |
 |---|---|---|
@@ -78,8 +136,8 @@ before, the OpenRouter path accepted `schema` and ignored it, so a backend
 switch or a quota fallback changed the response shape with nothing in the
 response saying so.
 
-Callers pick a **tier**, never a model name — that keeps model choice here (a
-restart) rather than in a consumer's deploy.
+On `/generate`, callers pick a **tier**, not a model name. The native Gemini
+route is different: the caller names the model in the URL.
 
 Tier models default to the CLI aliases `sonnet` and `haiku`, which resolve to
 the newest model in each family. The CLI that resolves them ships inside
@@ -109,7 +167,7 @@ invalid values, rewrite only the supplied `.env` keys via an atomic rename, and
 take effect in the running process immediately. `LLM_GATEWAY_CLAUDE_TIMEOUT_S`
 must remain below agent-mem's 200-second client timeout.
 
-## Every route has an off switch
+## Claude and OpenRouter routing
 
 | Env var | Values | Default |
 |---|---|---|
@@ -290,7 +348,7 @@ untouched. Bind-mounting the parent directory (`./config:/config`, with
 `LLM_GATEWAY_ENV_FILE=/config/.env`) lets the rename land on a normal file
 inside the mount, so live-and-persist works exactly as it does natively.
 
-## Status
+## Historical checks
 
 Verified live against the seat on 2026-07-31:
 
@@ -301,6 +359,3 @@ Verified live against the seat on 2026-07-31:
 - Embeddings work — 3072-dim vectors, cosine 0.49 on an unrelated pair
 - Harness overhead: **~700–800 input tokens per call** with tools stripped and
   settings disabled — roughly +38% on a 1.8k-token transcript
-
-Not yet done: agent-mem does not call this service yet. Its Gemini client is
-untouched by design, pending results from this experiment.
