@@ -4,19 +4,25 @@ import json
 import os
 from hmac import compare_digest
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import Final, Literal
 
 import anyio
 import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from pydantic_core import PydanticCustomError
 from starlette.requests import ClientDisconnect
 
 from . import config
-
-if TYPE_CHECKING:
-    from .main import GenerateIn
 
 _MAX_BYTES: Final = 1024 * 1024
 _BODY_TIMEOUT_S: Final = 10
@@ -34,6 +40,39 @@ _WORKER_ERROR_DETAILS: Final = {
 }
 
 
+class _CodexInput(BaseModel):
+    """Public request normalized for the isolated Codex worker."""
+
+    model_config = ConfigDict(
+        frozen=True, strict=True, allow_inf_nan=False, populate_by_name=True
+    )
+
+    system: str = ""
+    user: str
+    # The worker image ships separately; keep these fields in sync with GenerateInput.
+    model: str = Field(
+        default="gpt-6.2-sol", max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    )
+    effort: Literal["low", "medium", "high", "xhigh"] = "medium"
+    schema_: dict[str, JsonValue] | None = Field(default=None, alias="schema")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_tier(cls, value: JsonValue) -> JsonValue:
+        """Reject the retired field even when its value is null."""
+        if isinstance(value, dict) and "tier" in value:
+            raise PydanticCustomError("retired_tier", "Codex does not accept tier")
+        return value
+
+    @field_validator("user")
+    @classmethod
+    def nonblank_user(cls, value: str) -> str:
+        """Reject blank prompts before contacting the worker."""
+        if not value.strip():
+            raise PydanticCustomError("empty_prompt", "Empty user prompt")
+        return value
+
+
 def _require_service_key(request: Request) -> None:
     candidates = request.headers.getlist("x-api-key")
     if len(candidates) != 1:
@@ -49,7 +88,7 @@ def _require_service_key(request: Request) -> None:
         raise HTTPException(401, "bad or missing X-API-Key")
 
 
-async def _read_request(request: Request, model: type["GenerateIn"]) -> "GenerateIn":
+async def _read_request(request: Request) -> _CodexInput:
     payload = bytearray()
     try:
         with anyio.fail_after(_BODY_TIMEOUT_S):
@@ -57,16 +96,13 @@ async def _read_request(request: Request, model: type["GenerateIn"]) -> "Generat
                 if len(payload) + len(chunk) > _MAX_BYTES:
                     raise HTTPException(413, "Codex request too large")
                 payload.extend(chunk)
-        body = model.model_validate_json(payload)
+        return _CodexInput.model_validate_json(payload)
     except TimeoutError:
         raise HTTPException(408, "Codex request timed out") from None
     except ClientDisconnect:
         raise HTTPException(400, _INCOMPLETE_REQUEST) from None
     except ValidationError:
         raise HTTPException(422, _INVALID_REQUEST) from None
-    if not body.user.strip():
-        raise HTTPException(422, _INVALID_REQUEST)
-    return body
 
 
 class _WorkerResult(BaseModel):
@@ -134,14 +170,14 @@ async def _cancel_on_disconnect(request: Request, scope: anyio.CancelScope) -> N
     scope.cancel()
 
 
-async def generate(request: Request, model: type["GenerateIn"]) -> JSONResponse:
+async def generate(request: Request) -> JSONResponse:
     """Authenticate before reading the request or attempting worker access."""
     _require_service_key(request)
+    body = await _read_request(request)
     socket = Path(os.getenv("CODEX_WORKER_SOCKET", ""))
     if not socket.is_absolute():
         raise HTTPException(503, "Codex worker is not configured")
 
-    body = await _read_request(request, model)
     try:
         payload = json.dumps(
             body.model_dump(by_alias=True),
@@ -172,7 +208,13 @@ async def generate(request: Request, model: type["GenerateIn"]) -> JSONResponse:
     result_model = _WorkerText if body.schema_ is None else _WorkerOutput
     try:
         result = result_model.model_validate_json(raw)
-        response = JSONResponse({"backend": "codex", **result.model_dump()})
+        response = JSONResponse(
+            {
+                "backend": "codex",
+                **result.model_dump(exclude={"meta"}),
+                "meta": {**result.meta, "model": body.model, "effort": body.effort},
+            }
+        )
     except (ValueError, RecursionError):
         raise HTTPException(502, _BAD_WORKER_RESPONSE) from None
     if len(response.body) > _MAX_BYTES:

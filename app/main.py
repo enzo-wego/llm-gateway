@@ -1,10 +1,4 @@
-"""HTTP surface. Callers pick an intent tier; the gateway picks the backend.
-
-agent-mem asks for "a cheap judgement" or "a good summary", never for a model
-name. That keeps model and provider choices here — a systemd restart — instead
-of in a Go deploy, and it is what makes the Claude experiment reversible
-without touching agent-mem's gemini client at all.
-"""
+"""HTTP surface. Intent tiers supply defaults; Claude overrides require the seat."""
 
 import asyncio
 import logging
@@ -17,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from . import admin, alerts, claude, codex_gateway, config, gemini, gemini_proxy, openrouter
 from .access_log import path_access_log
+from .claude_overrides import ClaudeOverrides, ClaudeOverrideUnavailable
 from .health import register_health
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -37,18 +32,25 @@ class _Quota:
 
     def __init__(self) -> None:
         self.blocked_until: float = 0.0
+        self.family_blocks: dict[str, float] = {}
         self.last: dict[str, Any] | None = None
         self.calls = 0
         self.cost_usd = 0.0
         self.fallbacks = 0
 
-    def seat_available(self) -> bool:
-        return time.time() >= self.blocked_until
+    def seat_available(self, model: str = "") -> bool:
+        parts = model.removesuffix("[1m]").split("-")
+        deadline = max((self.family_blocks.get(part, 0.0) for part in parts), default=0.0)
+        return time.time() >= max(self.blocked_until, deadline)
 
-    def note_rejection(self, resets_at: int | None) -> None:
+    def note_rejection(self, resets_at: int | None, window: str = "") -> None:
         # Trust the reported reset; if absent, back off 15 minutes so a
         # missing timestamp can't wedge the seat off permanently.
-        self.blocked_until = float(resets_at) if resets_at else time.time() + 900
+        deadline = float(resets_at) if resets_at else time.time() + 900
+        if window in {"seven_day_opus", "seven_day_sonnet", "seven_day_haiku", "seven_day_fable"}:
+            self.family_blocks[window.removeprefix("seven_day_")] = deadline
+        else:
+            self.blocked_until = deadline
 
     def record(self, meta: dict[str, Any]) -> None:
         self.calls += 1
@@ -122,7 +124,7 @@ def _summarize(
 Tier = Literal["summary", "cheap"]
 
 
-class GenerateIn(BaseModel):
+class GenerateIn(ClaudeOverrides):
     system: str = ""
     user: str
     tier: Tier = "cheap"
@@ -131,7 +133,7 @@ class GenerateIn(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-class DescribeIn(BaseModel):
+class DescribeIn(ClaudeOverrides):
     system: str = ""
     prompt: str
     mime: str
@@ -166,13 +168,15 @@ def _active_model(tier: Tier) -> str:
 # ── routes ───────────────────────────────────────────────────────────────────
 @app.post("/codex", include_in_schema=False)
 async def generate_codex(request: Request) -> Response:
-    return await codex_gateway.generate(request, GenerateIn)
+    return await codex_gateway.generate(request)
 
 
 @app.post("/generate", dependencies=[Depends(require_key)])
 async def generate(body: GenerateIn, caller: str = Depends(caller_label)) -> dict[str, Any]:
     started = time.monotonic()
     backend, cmodel, ormodel, effort, thinking = _tier_config(body.tier)
+    cmodel = body.model or cmodel
+    effort = body.effort or effort
     actual_backend = backend
     actual_model = cmodel if backend == "claude" else ormodel
     status: int | str = 500
@@ -180,25 +184,30 @@ async def generate(body: GenerateIn, caller: str = Depends(caller_label)) -> dic
     cost = 0.0
 
     try:
-        if backend == "claude" and quota.seat_available():
+        seat_available = backend == "claude" and quota.seat_available(cmodel)
+        body.require_available_seat(backend=backend, seat_available=seat_available)
+        if seat_available:
             try:
                 res = await claude.generate(
                     system=body.system, user=body.user, model=cmodel,
-                    effort=effort, thinking=thinking, schema=body.schema_,
+                    effort=effort, thinking=None if body.explicit else thinking,
+                    schema=body.schema_,
                 )
+                if body.explicit:
+                    res["meta"].update(model=cmodel, effort=effort)
                 quota.record(res["meta"])
                 cost = _meta_cost(res["meta"])
                 status = 200
                 return {"backend": "claude", **res}
             except claude.QuotaExhausted as e:
                 reason = "quota_exhausted"
-                quota.note_rejection((quota.last or {}).get("resets_at"))
-                if not config.FALLBACK_ON_QUOTA:
+                quota.note_rejection(e.resets_at, e.window)
+                if body.explicit or not config.FALLBACK_ON_QUOTA:
                     status = 503
                     raise HTTPException(503, f"seat quota exhausted ({e})") from e
             except claude.ClaudeError as e:
                 reason = e.reason
-                if not config.FALLBACK_ON_QUOTA:
+                if body.explicit or not config.FALLBACK_ON_QUOTA:
                     status = 502
                     raise HTTPException(502, str(e)) from e
 
@@ -218,6 +227,9 @@ async def generate(body: GenerateIn, caller: str = Depends(caller_label)) -> dic
             quota.fallbacks += 1
         status = 200
         return {"backend": "openrouter", **res}
+    except ClaudeOverrideUnavailable as e:
+        status, reason = e.status_code, e.reason
+        raise
     except asyncio.CancelledError:
         status = "cancelled"
         reason = "external_cancelled"
@@ -237,34 +249,40 @@ async def generate(body: GenerateIn, caller: str = Depends(caller_label)) -> dic
 async def describe(body: DescribeIn, caller: str = Depends(caller_label)) -> dict[str, Any]:
     started = time.monotonic()
     backend = config.BACKEND_DESCRIBE
+    cmodel = body.model or config.MODEL_CHEAP
+    effort = body.effort or config.EFFORT_CHEAP
     actual_backend = backend
     status: int | str = 500
     reason = "none"
     cost = 0.0
 
     try:
-        if backend == "claude" and quota.seat_available():
+        seat_available = backend == "claude" and quota.seat_available(cmodel)
+        body.require_available_seat(backend=backend, seat_available=seat_available)
+        if seat_available:
             try:
                 res = await claude.describe(
                     system=body.system, prompt=body.prompt, mime=body.mime,
-                    data_b64=body.data_b64, model=config.MODEL_CHEAP,
-                    effort=config.EFFORT_CHEAP, thinking=config.THINKING_CHEAP,
+                    data_b64=body.data_b64, model=cmodel,
+                    effort=effort, thinking=None if body.explicit else config.THINKING_CHEAP,
                     schema=body.schema_,
                 )
+                if body.explicit:
+                    res["meta"].update(model=cmodel, effort=effort)
                 quota.record(res["meta"])
                 cost = _meta_cost(res["meta"])
                 status = 200
                 return {"backend": "claude", **res}
             except claude.QuotaExhausted as e:
                 reason = "quota_exhausted"
-                quota.note_rejection((quota.last or {}).get("resets_at"))
-                if not config.FALLBACK_ON_QUOTA:
+                quota.note_rejection(e.resets_at, e.window)
+                if body.explicit or not config.FALLBACK_ON_QUOTA:
                     status = 503
                     raise HTTPException(503, f"seat quota exhausted ({e})") from e
                 log.warning("seat quota exhausted (%s) — falling back to OpenRouter", e)
             except claude.ClaudeError as e:
                 reason = e.reason
-                if not config.FALLBACK_ON_QUOTA:
+                if body.explicit or not config.FALLBACK_ON_QUOTA:
                     status = 502
                     raise HTTPException(502, str(e)) from e
                 log.error("claude describe failed (%s) — falling back to OpenRouter", e)
@@ -285,6 +303,9 @@ async def describe(body: DescribeIn, caller: str = Depends(caller_label)) -> dic
             quota.fallbacks += 1
         status = 200
         return {"backend": "openrouter", **res}
+    except ClaudeOverrideUnavailable as e:
+        status, reason = e.status_code, e.reason
+        raise
     except asyncio.CancelledError:
         status = "cancelled"
         reason = "external_cancelled"

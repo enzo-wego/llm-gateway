@@ -86,14 +86,22 @@ Do not send the general gateway key or the worker's provider credential.
 Clients not opted in should keep their current route and authentication.
 Use a client deadline longer than the gateway's 180-second worker deadline.
 
-Example request (assuming `CODEX_PROJECT_KEY` has been injected locally by
+Example requests (assuming `CODEX_PROJECT_KEY` has been injected locally by
 the project's secret manager):
 
 ```sh
+# Defaults: model="gpt-6.2-sol", effort="medium"
 curl -sS --max-time 200 \
   -H "X-API-Key: ${CODEX_PROJECT_KEY:?set the dedicated project key}" \
   -H 'Content-Type: application/json' \
-  --data '{"user":"Summarize: the release is postponed.","tier":"cheap"}' \
+  --data '{"user":"Summarize: the release is postponed."}' \
+  http://127.0.0.1:8750/codex
+
+# Explicit model and effort override
+curl -sS --max-time 200 \
+  -H "X-API-Key: ${CODEX_PROJECT_KEY:?set the dedicated project key}" \
+  -H 'Content-Type: application/json' \
+  --data '{"user":"Summarize: the release is postponed.","model":"gpt-6.2-sol","effort":"low"}' \
   http://127.0.0.1:8750/codex
 ```
 
@@ -101,20 +109,37 @@ curl -sS --max-time 200 \
 | --- | --- |
 | `user` | Required prompt string |
 | `system` | Optional instruction string |
-| `tier` | Optional `cheap` or `summary` |
+| `model` | Optional Codex model identifier; defaults to `gpt-6.2-sol` independently of `effort` |
+| `effort` | Optional reasoning effort (`low`, `medium`, `high`, `xhigh`); defaults to `medium` independently of `model` |
 | `schema` | Optional JSON Schema object for structured output |
 
+`model` and `effort` are independent optional fields. Omitting `model` selects
+`gpt-6.2-sol`; omitting `effort` selects `medium`.
+
+**Migrating from legacy `tier` requests:** `/codex` no longer accepts `tier`
+and rejects any payload that includes the `"tier"` key, even `"tier": null`,
+with HTTP `422`. Update existing callers before switching them to this branch:
+
+| Legacy `/codex` field | Replacement on `/codex` |
+| --- | --- |
+| `"tier": "cheap"` (or omitted `tier` expecting low effort) | `"effort": "low"` (with default `model` `gpt-6.2-sol`, or set `model` explicitly) |
+| `"tier": "summary"` | `"effort": "medium"` (or omit `effort` to use the `medium` default) |
+
 Without `schema`, read `text` from the 200 JSON response:
-`{"backend":"codex","text":"The release was postponed.","meta":{}}`.
+`{"backend":"codex","text":"The release was postponed.","meta":{"model":"gpt-6.2-sol","effort":"low"}}`.
 With `schema`, read `output` as JSON rather than decoding a string:
-`{"backend":"codex","output":{"summary":"The release was postponed."},"meta":{}}`.
-Use reported usage in `meta` when available; absent usage does not mean zero.
+`{"backend":"codex","output":{"summary":"The release was postponed."},"meta":{"model":"gpt-6.2-sol","effort":"medium"}}`.
+`meta.model` and `meta.effort` echo the model and reasoning effort requested
+for that call (after applying defaults); they report the requested settings
+handed to the worker, not confirmation from the upstream provider of which
+model or effort executed. Use reported usage in `meta` when available; absent
+usage does not mean zero.
 
 | HTTP status | Meaning |
 | --- | --- |
 | `401` | Missing, invalid, shared, or ambiguous `X-API-Key`; check the project's dedicated key |
 | `400` / `408` | Incomplete request or timed out while reading the body |
-| `413` / `422` | Request exceeds 1 MiB or fails JSON/payload validation |
+| `413` / `422` | Request exceeds 1 MiB, includes the rejected legacy `tier` field (even `"tier": null`), or fails JSON/payload validation |
 | `429` | Worker is busy; back off before retrying |
 | `503` | Worker execution is disabled or the socket path is not configured |
 | `502` | Cannot reach the worker, or the worker returned an invalid response or upstream error; check worker startup, socket ownership, and worker auth |
