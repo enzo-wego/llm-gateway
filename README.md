@@ -132,8 +132,9 @@ Slack alert. Quota exhaustion becomes a notification, not an outage.
 The pool is **off by default**. Leave `LLM_GATEWAY_SECRET_KEY` unset unless you
 need the Gemini pass-through (`/gemini/*`). Setting it enables the pool and
 provides the secret used to encrypt pooled keys and sign admin sessions. Keep
-the secret stable across restarts. Proxy callers send it in `x-goog-api-key`,
-not in the query string. The pool does not change `/embed`'s separate fallback
+`LLM_GATEWAY_SECRET_KEY` server-only and stable across restarts. Proxy callers
+send `LLM_GATEWAY_API_KEY` in the `x-goog-api-key` header, never in the query
+string. The pool does not change `/embed`'s separate fallback
 through `GEMINI_API_KEY`.
 
 With the pool off, `/health` omits `gemini_pool`. With the pool on, it reports
