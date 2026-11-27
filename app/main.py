@@ -15,12 +15,16 @@ from typing import Annotated, Any, Literal
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from . import alerts, claude, config, gemini, openrouter
+from . import admin, alerts, claude, config, gemini, gemini_proxy, openrouter
+from .access_log import path_access_log
+from .health import register_health
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("llm-gateway")
-
 app = FastAPI(title="llm-gateway", docs_url=None, redoc_url=None)
+app.middleware("http")(path_access_log)
+app.include_router(gemini_proxy.router)
+app.include_router(admin.router)
 
 
 # ── quota state ──────────────────────────────────────────────────────────────
@@ -404,37 +408,7 @@ async def put_config(body: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="failed to persist gateway configuration") from exc
 
 
-@app.get("/health")
-async def health() -> dict[str, Any]:
-    """Unauthenticated: it exposes no secrets and systemd/uptime checks need it."""
-    return {
-        "ok": True,
-        "backends": {
-            "summary": config.BACKEND_SUMMARY,
-            "cheap": config.BACKEND_CHEAP,
-            "describe": config.BACKEND_DESCRIBE,
-            "embed": "openrouter",
-        },
-        "models": {
-            "summary": _active_model("summary"),
-            "cheap": _active_model("cheap"),
-            "describe": config.MODEL_CHEAP if config.BACKEND_DESCRIBE == "claude" else config.OR_MODEL_DESCRIBE,
-            "embed": config.EMBED_MODEL,
-        },
-        "seat": {
-            "available": quota.seat_available(),
-            "blocked_until": quota.blocked_until or None,
-            "last_rate_limit": quota.last,
-        },
-        "counters": {
-            "claude_calls": quota.calls,
-            "notional_cost_usd": round(quota.cost_usd, 4),
-            "openrouter_fallbacks": quota.fallbacks,
-        },
-        "fallback_on_quota": config.FALLBACK_ON_QUOTA,
-        "embed_fallback": "gemini" if config.GEMINI_API_KEY else None,
-        "alerts_enabled": config.ALERTS_ENABLED,
-    }
+register_health(app, lambda: quota, _active_model)
 
 
 @app.on_event("startup")
@@ -448,5 +422,7 @@ async def _startup() -> None:
         config.EMBED_MODEL,
         config.FALLBACK_ON_QUOTA, config.ALERTS_ENABLED,
     )
+    if not config.OPENROUTER_KEY:
+        log.warning("OPENROUTER_API_KEY unset — /generate fallback, /describe and /embed will answer 502")
     if not config.ALERTS_ENABLED:
         log.warning("Slack alerting disabled — quota exhaustion will only be logged")

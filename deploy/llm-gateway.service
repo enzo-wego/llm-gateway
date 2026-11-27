@@ -22,7 +22,7 @@ UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 Environment=HOME=/home/enzo
 
 ExecStart=/var/go/src/github.com/llm-gateway/.venv/bin/uvicorn app.main:app \
-    --host ${LLM_GATEWAY_HOST} --port ${LLM_GATEWAY_PORT} --log-level info
+    --host ${LLM_GATEWAY_HOST} --port ${LLM_GATEWAY_PORT} --log-level info --no-access-log
 
 Restart=on-failure
 RestartSec=5s

@@ -30,6 +30,8 @@ services:
       - ./config:/config
       # Claude CLI session state lives under $HOME (/home/app).
       - claude-home:/home/app
+      # Optional Gemini key pool and request history survive recreation.
+      - gateway-data:/data
     # Loopback only. Host exposure is never 0.0.0.0 here.
     ports:
       - "127.0.0.1:8750:8750"
@@ -39,3 +41,4 @@ services:
 
 volumes:
   claude-home:
+  gateway-data:

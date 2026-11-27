@@ -33,7 +33,7 @@ recomputing every stored vector and would silently degrade search until you did.
 
 ## Endpoints
 
-All routes except `/health` require `X-API-Key`.
+The core routes below require `X-API-Key`, except for `/health`.
 
 | Route | Backend | Body |
 |---|---|---|
@@ -42,7 +42,7 @@ All routes except `/health` require `X-API-Key`.
 | `POST /embed` | OpenRouter, then Gemini on cap exhaustion | `{texts: [...], dims, fallback?}` (`fallback` defaults to `true`; `false` disables Gemini fallback for that request) |
 | `GET /config` | — | current editable, non-secret runtime configuration |
 | `PUT /config` | — | partial configuration update, applied live and persisted to `.env` |
-| `GET /health` | — | quota state, counters, active backends |
+| `GET /health` | — | gateway liveness, quota state, counters, active backends, and optional pool readiness |
 | `GET /usage` | — | seat and OpenRouter budget, plus per-caller `callers` counters |
 
 The Gemini fallback retries HTTP 429, 500, 502, 503, 504 and network errors up
@@ -127,6 +127,37 @@ With `FALLBACK_ON_QUOTA=true`, exhausting the seat's window degrades that route
 to OpenRouter for the rest of the window instead of failing, and still fires the
 Slack alert. Quota exhaustion becomes a notification, not an outage.
 
+## Optional Gemini key pool
+
+The pool is **off by default**. Leave `LLM_GATEWAY_SECRET_KEY` unset unless you
+need the Gemini pass-through (`/gemini/*`). Setting it enables the pool and
+provides the secret used to encrypt pooled keys and sign admin sessions. Keep
+`LLM_GATEWAY_SECRET_KEY` server-only and stable across restarts. Proxy callers
+send `LLM_GATEWAY_API_KEY` in the `x-goog-api-key` header, never in the query
+string. The pool does not change `/embed`'s separate fallback
+through `GEMINI_API_KEY`.
+
+With the pool off, `/health` omits `gemini_pool`. With the pool on, it reports
+key counts when SQLite is accessible, or `{"gemini_pool":{"ready":false}}` if
+SQLite cannot be checked within the probe deadline. HTTP 200 and `"ok": true`
+still indicate gateway liveness, not pool or provider readiness.
+
+Compose persists the default `/data/gateway.db` in the `gateway-data` named
+volume on base, VPS and office deployments. Keep a custom container database
+path under `/data` or give it its own persistent mount. For a native launch,
+set `LLM_GATEWAY_DB_PATH` to a persistent path writable by the gateway service
+user. Preserve both the database and its encryption secret when moving a pool.
+
+Leave `LLM_GATEWAY_ADMIN_PASSWORD` unset on any deployment that cannot protect
+`/admin` and its subpaths. The optional dashboard is served by the same gateway
+listener, not a separate admin service. Before enabling it, restrict these
+paths to operators and require HTTPS on their access path. Block the admin
+paths on all public or shared ingress, and ensure clients cannot bypass those
+controls by reaching the backend listener directly. The office override
+publishes the shared listener on `GATEWAY_BIND:8791` over HTTP; that publish is
+not a private HTTPS admin endpoint. A Docker host loopback publish also does
+not restrict peers on a shared Docker network.
+
 ## Alerting
 
 Three failures stop ingestion with no visible error at the caller, so each posts
@@ -162,10 +193,14 @@ can spawn a subprocess that inherits it. Don't put it in `.env` either.
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env       # set LLM_GATEWAY_API_KEY and OPENROUTER_API_KEY
 set -a && . ./.env && set +a
-env -u ANTHROPIC_API_KEY .venv/bin/uvicorn app.main:app --port 8750
+env -u ANTHROPIC_API_KEY .venv/bin/uvicorn app.main:app --port 8750 --no-access-log
 ```
 
 Your Mac is already logged into Claude Code, so the seat path works immediately.
+
+Keep `--no-access-log` on custom Uvicorn launches too. The gateway logs method,
+path, status and latency without query strings. Any reverse proxy in front
+must also omit query strings from access logs.
 
 ## VPS deployment
 
