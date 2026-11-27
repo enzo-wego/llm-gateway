@@ -14,7 +14,111 @@ or Codex route when your application specifically needs that provider.
 | Call a Gemini model directly through the key pool | `POST /gemini/v1beta/models/{model}:{action}` | `x-goog-api-key: $LLM_GATEWAY_API_KEY` | Gemini's native response, not the gateway `text` wrapper |
 | Generate text or JSON with Codex | `POST /codex` | `X-API-Key` with the calling project's **dedicated Codex key** | `backend: "codex"`, `text` or `output`, `meta` |
 
-### Caller examples
+## How model selection works
+
+A **backend** is the integration that handles a request (for example, Claude
+or OpenRouter). A **model ID** or **alias** selects a model in that integration.
+A **tier** is a gateway request field; it is not a model ID. In particular,
+`"tier":"summary"` has different effects on `/generate` and `/codex`.
+
+| Route | Where the model is selected | If you omit `tier` | Can a retry change the model? |
+|---|---|---|---|
+| `/generate` | Server maps tier → backend → configured model or alias | Uses `cheap` | A configured Claude → OpenRouter fallback can change the backend and model. |
+| `/gemini/v1beta/models/{model}:{action}` | Caller names the Google model in the URL | No gateway tier exists | Pool failover changes the **API key**, not the requested model or action. |
+| `/codex` | The worker runs Codex CLI without a model override | Uses `cheap` → low reasoning effort | No gateway provider fallback. `summary` requests more effort, not another model. |
+
+### `/generate`: let the gateway choose
+
+For `{"tier":"summary","user":"Summarize this incident."}`, the gateway:
+
+1. Reads `BACKEND_SUMMARY`. If it is `claude`, it passes `MODEL_SUMMARY`,
+   `EFFORT_SUMMARY`, and the tier's thinking configuration to the Claude SDK.
+   If it is `openrouter`, it sends `OR_MODEL_SUMMARY` to OpenRouter instead.
+   `cheap` follows the same path using the `_CHEAP` settings. Claude effort
+   settings are not forwarded to OpenRouter.
+2. If a Claude call fails with a quota or adapter error, `FALLBACK_ON_QUOTA`
+   controls that request: `true` tries the tier's OpenRouter model; `false`
+   returns the error. A **subsequent** request behaves differently if a prior
+   quota rejection has already marked the seat unavailable: the current handler
+   skips Claude and goes straight to OpenRouter even when the flag is false.
+   Selecting OpenRouter as primary does not set up a reverse fallback to Claude.
+3. Returns `backend` for the integration that actually answered. `meta.model`
+   on a successful generation is the model identifier the adapter requested;
+   if that identifier is an alias, it does not prove the exact provider model
+   version. Adding `schema` changes the answer from `text` to parsed `output`,
+   not the tier or model selection.
+
+**Mac mini snapshot — November 27, 2026.** These are deployment settings
+observed via `/health` and `/config`, not promises about every installation:
+
+| Tier | Primary backend | Claude model / effort | Configured OpenRouter alternative |
+|---|---|---|---|
+| `cheap` (default) | `claude` | `haiku` / `low` | `~anthropic/claude-haiku-latest` |
+| `summary` | `claude` | `sonnet` / `medium` | `~anthropic/claude-sonnet-latest` |
+
+`FALLBACK_ON_QUOTA` was **false** on this mini even though its code default
+is `true`. The OpenRouter entries above are configured alternatives, not the
+primary models. An operator can change the tier mapping
+without changing callers. Clients should send `tier`, not a `model` or
+`backend` field, to `/generate`.
+
+### `/gemini`: choose the model yourself
+
+In `/gemini/v1beta/models/gemini-2.5-flash:generateContent`, the model is
+`gemini-2.5-flash` and the action is `generateContent`. The gateway selects
+a pooled key and posts the caller's body to that same Google model and action.
+If that key is rate-limited or rejected, it can try another key; it does not
+switch from Flash to Pro, reinterpret the body as a gateway tier, or send
+the request to OpenRouter. To choose another model, change the **URL** to an
+ID that supports the action and is available to your pooled keys.
+
+For the same incident summary, send
+`{"contents":[{"parts":[{"text":"Summarize this incident."}]}]}` to the URL
+above. To count tokens rather than generate, leave the model ID in place and
+change the suffix to `:countTokens`. The response is Google's native JSON:
+look for `candidates` on a generation or `totalTokens` on a count. If Google
+includes `modelVersion` in a generation response, it is passed through;
+there is no gateway `meta.model` wrapper. The separate `/embed` route does
+not use this URL-based model selection or the pooled credentials.
+
+### `/codex`: choose effort, not a GPT model
+
+Send `{"tier":"summary","user":"Summarize this incident."}` to `/codex`
+with your project's **dedicated** `X-API-Key`. The gateway authenticates the
+project and sends the request over a private socket to the worker. The worker
+starts a fresh `codex exec` with these settings:
+
+| Request | Worker setting | Model argument |
+|---|---|---|
+| Omit `tier`, or send `"tier":"cheap"` | `model_reasoning_effort="low"` | No `--model` |
+| Send `"tier":"summary"` | `model_reasoning_effort="medium"` | No `--model` |
+
+The CLI uses its default model under the worker's authenticated identity.
+The worker also passes `--ignore-user-config`, so editing a developer's local
+Codex config is not a way to pin this route. The gateway does not expose a
+per-request `model` override. A successful reply identifies `backend: "codex"`
+and returns `text` or `output`; the current worker returns `meta: {}`. **You
+cannot infer an exact GPT model ID from that response or from the tier.**
+If your application must audit or pin a specific model, the worker needs
+explicit model configuration and reporting before this route meets that need.
+
+### Check your deployment without calling a model
+
+```sh
+GW="${GW:-http://127.0.0.1:8750}"
+curl -fsS "$GW/health" | jq '{backends, models}'
+curl -fsS "$GW/config" -H "X-API-Key: $LLM_GATEWAY_API_KEY" |
+  jq '{BACKEND_CHEAP, MODEL_CHEAP, OR_MODEL_CHEAP, EFFORT_CHEAP,
+       BACKEND_SUMMARY, MODEL_SUMMARY, OR_MODEL_SUMMARY, EFFORT_SUMMARY,
+       FALLBACK_ON_QUOTA}'
+```
+
+`/health` shows the configured primary model for each core route, not which
+provider served a particular request. For that, inspect the generation
+response's `backend`. Neither diagnostic resolves the Codex CLI's default
+model or inventories the Google models accessible to each pool key.
+
+## Caller examples
 
 Run these on the gateway host, or set `GW` to the gateway address reachable
 from your application. Inside another container, `127.0.0.1` refers to that
@@ -95,7 +199,7 @@ The provider-specific Gemini and Codex routes use the credentials listed above.
 
 | Route | Backend | Body |
 |---|---|---|
-| `POST /generate` | seat or OpenRouter | `{system, user, tier: "summary"\|"cheap", schema?}` |
+| `POST /generate` | seat or OpenRouter | `{system?, user, tier?: "summary"\|"cheap", schema?}`; default tier: `cheap` |
 | `POST /describe` | seat or OpenRouter | `{system, prompt, mime, data_b64, schema?}` |
 | `POST /embed` | OpenRouter, then Gemini on cap exhaustion | `{texts: [...], dims, fallback?}` (`fallback` defaults to `true`; `false` disables Gemini fallback for that request) |
 | `GET /config` | — | current editable, non-secret runtime configuration |
