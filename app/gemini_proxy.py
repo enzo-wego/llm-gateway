@@ -2,8 +2,8 @@
 
 Callers (the chatbot's @ai-sdk/google) authenticate with the gateway secret in
 ``x-goog-api-key``; the gateway swaps in a pooled key, forwards body bytes
-unchanged and returns the upstream status/body unchanged. A failing key is put
-in cooldown or marked rejected and the next key is tried.
+unchanged unless the caller opts into effort, and relays the upstream response.
+A failing key is put in cooldown or marked rejected and the next key is tried.
 
 Never logs or stores prompt/response content, and never logs a key.
 """
@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTask
 
 from . import config, gemini_store as store
+from .gemini_proxy_effort import EffortError, apply_effort
 from .gemini_proxy_stream import RelayResponse, close_upstream, read_attempt, stream_response
 
 log = logging.getLogger("llm-gateway.gemini")
@@ -170,9 +171,10 @@ class _Call:
 @router.post("/gemini/v1beta/models/{spec}")
 async def proxy(spec: str, request: Request) -> Response:
     started = time.monotonic()
+    efforts = request.query_params.getlist("effort")
     if not _check_caller(request):
         response = _json(401, "unauthorized")
-        if store.enabled():
+        if not efforts and store.enabled():
             response.background = _record("gemini", None, None, 401, started, 0)
         return response
     if not store.enabled():
@@ -181,10 +183,17 @@ async def proxy(spec: str, request: Request) -> Response:
     model, _, action = spec.rpartition(":")
     if not model or action not in ACTIONS or not _MODEL_RE.match(model):
         response = _json(404, "not_found")
-        response.background = _record("gemini:unknown", None, None, 404, started, 0)
+        if not efforts:
+            response.background = _record("gemini:unknown", None, None, 404, started, 0)
         return response
 
-    call = _Call(model, action, started, await request.body(), request.query_params.get("alt") == "sse",
+    body = await request.body()
+    if efforts:
+        try:
+            body = apply_effort(model, action, efforts, body)
+        except EffortError as exc:
+            return _json(400, exc.code)
+    call = _Call(model, action, started, body, request.query_params.get("alt") == "sse",
                  request.headers.get("content-type", "application/json"))
     if call.streaming:
         return RelayResponse(partial(_forward, call))
