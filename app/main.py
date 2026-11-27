@@ -12,35 +12,19 @@ import re
 import time
 from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from . import admin, alerts, claude, config, gemini, gemini_proxy, gemini_store, openrouter
+from . import admin, alerts, claude, config, gemini, gemini_proxy, openrouter
+from .access_log import path_access_log
+from .health import register_health
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("llm-gateway")
-# Not a child of "llm-gateway": per-request access lines must not mix into its handlers.
-access_log_ = logging.getLogger("gw-access")
-
 app = FastAPI(title="llm-gateway", docs_url=None, redoc_url=None)
+app.middleware("http")(path_access_log)
 app.include_router(gemini_proxy.router)
 app.include_router(admin.router)
-
-
-@app.middleware("http")
-async def access_log(request: Request, call_next):
-    """method path status latency_ms. Never the query string: a caller that
-    mistakenly sends ?key=<real key> must not land it in the logs. Replaces
-    uvicorn's access log (Dockerfile passes --no-access-log)."""
-    started = time.monotonic()
-    status = 500
-    try:
-        response = await call_next(request)
-        status = response.status_code
-        return response
-    finally:
-        access_log_.info("%s %s %s %dms", request.method, request.url.path, status,
-                 int((time.monotonic() - started) * 1000))
 
 
 # ── quota state ──────────────────────────────────────────────────────────────
@@ -424,39 +408,7 @@ async def put_config(body: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="failed to persist gateway configuration") from exc
 
 
-@app.get("/health")
-async def health() -> dict[str, Any]:
-    """Unauthenticated: it exposes no secrets and systemd/uptime checks need it."""
-    pool = gemini_store.pool_counts() if gemini_store.enabled() else None
-    return {
-        "ok": True,
-        **({"gemini_pool": pool} if pool is not None else {}),
-        "backends": {
-            "summary": config.BACKEND_SUMMARY,
-            "cheap": config.BACKEND_CHEAP,
-            "describe": config.BACKEND_DESCRIBE,
-            "embed": "openrouter",
-        },
-        "models": {
-            "summary": _active_model("summary"),
-            "cheap": _active_model("cheap"),
-            "describe": config.MODEL_CHEAP if config.BACKEND_DESCRIBE == "claude" else config.OR_MODEL_DESCRIBE,
-            "embed": config.EMBED_MODEL,
-        },
-        "seat": {
-            "available": quota.seat_available(),
-            "blocked_until": quota.blocked_until or None,
-            "last_rate_limit": quota.last,
-        },
-        "counters": {
-            "claude_calls": quota.calls,
-            "notional_cost_usd": round(quota.cost_usd, 4),
-            "openrouter_fallbacks": quota.fallbacks,
-        },
-        "fallback_on_quota": config.FALLBACK_ON_QUOTA,
-        "embed_fallback": "gemini" if config.GEMINI_API_KEY else None,
-        "alerts_enabled": config.ALERTS_ENABLED,
-    }
+register_health(app, lambda: quota, _active_model)
 
 
 @app.on_event("startup")
