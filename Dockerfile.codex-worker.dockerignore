@@ -1,0 +1,4 @@
+**
+!codex_worker/
+!codex_worker/**/*.py
+codex_worker/**/__pycache__/

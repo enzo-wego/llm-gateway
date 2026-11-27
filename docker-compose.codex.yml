@@ -1,0 +1,36 @@
+# Explicit opt-in: docker compose -f docker-compose.yml -f docker-compose.codex.yml ...
+services:
+  llm-gateway:
+    environment:
+      CODEX_WORKER_SOCKET: /run/codex-worker/worker.sock
+    volumes:
+      - codex-worker-socket:/run/codex-worker:ro
+    depends_on:
+      - codex-worker
+
+  codex-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.codex-worker
+    environment:
+      # Empty fails closed; the executable must be selected by the operator.
+      CODEX_WORKER_EXECUTABLE: "${CODEX_WORKER_EXECUTABLE:-}"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - codex-worker-socket:/run/codex-worker
+      - codex-worker-home:/home/codex/.codex
+    # Provider egress, without joining any gateway network.
+    networks:
+      - codex-worker-egress
+    restart: unless-stopped
+
+volumes:
+  codex-worker-socket:
+  codex-worker-home:
+
+networks:
+  codex-worker-egress:

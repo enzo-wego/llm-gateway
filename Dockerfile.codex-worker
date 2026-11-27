@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+FROM node:24-bookworm-slim AS codex-cli
+RUN npm install --global --no-audit --no-fund @openai/codex@0.166.0
+
+FROM python:3.12-slim-bookworm AS worker-runtime
+COPY --from=codex-cli /usr/local/bin/node /usr/local/bin/node
+COPY --from=codex-cli /usr/local/lib/node_modules/@openai/codex/ /usr/local/lib/node_modules/@openai/codex/
+RUN ln -s ../lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex \
+ && groupadd --gid 1001 codex \
+ && useradd --uid 1001 --gid 1001 --create-home --home-dir /home/codex codex \
+ && install -d -m 0700 -o codex -g codex /home/codex/.codex /run/codex-worker
+
+ENV HOME=/home/codex \
+    CODEX_HOME=/home/codex/.codex \
+    CODEX_WORKER_SOCKET=/run/codex-worker/worker.sock \
+    PYTHONUNBUFFERED=1
+WORKDIR /app
+USER codex
+RUN test "$(codex --version)" = "codex-cli 0.166.0"
+
+FROM worker-runtime
+USER root
+RUN pip install --no-cache-dir 'fastapi>=0.115' 'uvicorn>=0.32'
+COPY codex_worker/ ./codex_worker/
+USER codex
+CMD ["uvicorn", "codex_worker.main:app", "--uds", "/run/codex-worker/worker.sock", "--no-access-log"]
