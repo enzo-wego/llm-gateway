@@ -2,6 +2,9 @@
 # platform-specific binary shipped inside claude-agent-sdk, so dependencies are
 # pip-installed for the target platform at build time. No Node runtime is
 # needed, and the host's .venv / site-packages must never be copied in.
+FROM node:24-bookworm-slim AS swagger
+RUN npm install --prefix /ui --ignore-scripts --no-audit --no-fund swagger-ui-dist@5.36.0
+
 FROM python:3.12-slim
 
 # Match the VPS host user (enzo = 1001:1001) so the container can write to the
@@ -21,6 +24,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=app:app app/ ./app/
+COPY --from=swagger /ui/node_modules/swagger-ui-dist/swagger-ui-bundle.js /ui/node_modules/swagger-ui-dist/swagger-ui.css /ui/node_modules/swagger-ui-dist/LICENSE /app/swagger/
 
 # Env-loader entrypoint: reloads the persisted env file on every start so
 # PUT /config survives `docker compose restart` (see the script's header). This

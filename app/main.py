@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from . import admin, alerts, claude, codex_gateway, config, gemini, gemini_proxy, openrouter
 from .access_log import path_access_log
+from .api_reference import install_reference
 from .claude_overrides import ClaudeOverrides, ClaudeOverrideUnavailable
 from .health import register_health
 
@@ -166,7 +167,7 @@ def _active_model(tier: Tier) -> str:
 
 
 # ── routes ───────────────────────────────────────────────────────────────────
-@app.post("/codex", include_in_schema=False)
+@app.post("/codex")
 async def generate_codex(request: Request) -> Response:
     return await codex_gateway.generate(request)
 
@@ -441,6 +442,7 @@ async def put_config(body: dict[str, Any]) -> dict[str, Any]:
 
 
 register_health(app, lambda: quota, _active_model)
+install_reference(app)
 
 
 @app.on_event("startup")

@@ -4,6 +4,27 @@ One HTTP gateway for Claude, OpenRouter, Google Gemini, and OpenAI Codex.
 Use `/generate` when you want the gateway to choose a backend. Use the Gemini
 or Codex route when your application specifically needs that provider.
 
+## Swagger: request and response reference
+
+On the gateway host, open **`http://127.0.0.1:8750/docs`** for Swagger UI or
+**`http://127.0.0.1:8750/openapi.json`** for the machine-readable contract.
+From your laptop, run `ssh -N -L 18750:127.0.0.1:8750 payments` and open
+`http://127.0.0.1:18750/docs`. The tunnel does not change the mini's loopback binding.
+Expand an operation for its headers, path/query parameters, JSON body, defaults,
+example requests, success shapes, and errors. The Gemini `spec` field is the entire
+`model:action` string (for example `gemini-2.5-flash:generateContent`); its five
+actions use different native Google payloads.
+
+Reading the reference needs no key. **Try it out executes a real request**:
+use `GatewayKey` for shared routes, `GeminiGatewayKey` for the Gemini proxy,
+or `CodexProjectKey` for `/codex`. Never enter a provider credential. `/health`
+requires none. `PUT /config` changes live settings; `GET /config` just reads them.
+The `/admin` HTML dashboard is an operator interface, not a caller JSON API.
+Docker serves Swagger's JavaScript and CSS locally. For a native checkout,
+install `swagger-ui-dist@5.36.0` with npm and copy `swagger-ui-bundle.js`,
+`swagger-ui.css`, and `LICENSE` from the package to `swagger/` at the repository
+root to enable the UI; `/openapi.json` needs no browser assets.
+
 ## Mac mini deployment check
 
 Verified **November 27, 2026, at 18:20 UTC** on the deployed gateway and
