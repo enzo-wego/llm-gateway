@@ -120,7 +120,6 @@ async def generate_text(body: GenerateInput) -> str:
                     cwd=workspace,
                     env=env,
                     start_new_session=True,
-                    umask=0o077,
                 )
             try:
                 stdout = process.stdout
