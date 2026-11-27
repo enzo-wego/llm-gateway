@@ -1,6 +1,7 @@
 """HTTP and upstream wire contracts for the opt-in Gemini effort parameter."""
 
 import json
+from decimal import Decimal
 from sqlite3 import connect
 
 import httpx
@@ -10,6 +11,15 @@ from fastapi.testclient import TestClient
 from gemini_test_support import KEYS, Upstream, add, client, config, env, post
 
 _MODELS = "/gemini/v1beta/models"
+
+
+def test_effort_preserves_arbitrary_precision_numbers(client: TestClient, env: Upstream) -> None:
+    add(1)
+    body = b'{"contents":[{"parts":[{"functionResponse":{"response":{"amount":9007199254740993.25,"tiny":1e-450}}}]}]}'
+    res = post(client, f"{_MODELS}/gemini-2.5-flash:generateContent?effort=low", body=body)
+    assert res.status_code == 200
+    forwarded = json.loads(env.bodies[-1], parse_float=Decimal)
+    assert forwarded["contents"] == json.loads(body, parse_float=Decimal)["contents"]
 
 
 @pytest.mark.parametrize(

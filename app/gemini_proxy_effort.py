@@ -54,6 +54,20 @@ def _reject_constant(_: str) -> Never:
     raise EffortError("invalid_effort_body")
 
 
+class _Number(str):
+    """A numeric lexeme already validated by the JSON decoder."""
+
+
+def _dump(value: JsonValue) -> str:
+    if isinstance(value, _Number):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ",".join(map(_dump, value)) + "]"
+    if isinstance(value, dict):
+        return "{" + ",".join(json.dumps(k) + ":" + _dump(v) for k, v in value.items()) + "}"
+    return json.dumps(value, allow_nan=False)
+
+
 def _config_key(parent: Mapping[str, JsonValue], camel: str, snake: str) -> str:
     if camel in parent and snake in parent:
         raise EffortError("ambiguous_effort_body")
@@ -86,6 +100,7 @@ def apply_effort(model: str, action: str, efforts: Sequence[str], body: bytes) -
     try:
         payload: JsonValue = json.loads(
             body, object_pairs_hook=_unique_object, parse_constant=_reject_constant,
+            parse_float=_Number, parse_int=_Number,
         )
         if not isinstance(payload, dict):
             raise EffortError("invalid_effort_body")
@@ -107,6 +122,6 @@ def apply_effort(model: str, action: str, efforts: Sequence[str], body: bytes) -
         ):
             raise EffortError("invalid_thinking_config")
         thinking[name] = value
-        return json.dumps(payload, allow_nan=False, separators=(",", ":")).encode()
+        return _dump(payload).encode()
     except (ValueError, RecursionError):
         raise EffortError("invalid_effort_body") from None
