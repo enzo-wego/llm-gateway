@@ -10,7 +10,7 @@ import os
 import sqlite3
 import time
 from contextlib import closing
-from typing import Any
+from threading import Lock
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -19,6 +19,7 @@ from . import config
 COOLDOWN_BASE_S = 60
 COOLDOWN_MAX_S = 900
 LOG_RETENTION_S = 7 * 86400
+DB_BUSY_TIMEOUT_S = 0.25
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS gemini_keys (
@@ -32,7 +33,8 @@ CREATE TABLE IF NOT EXISTS gemini_keys (
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     last_used_at REAL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    operator_version INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS request_log (
     ts REAL NOT NULL,
@@ -49,7 +51,9 @@ CREATE INDEX IF NOT EXISTS request_log_ts ON request_log (ts);
 """
 
 _inited: set[str] = set()
-_last_prune = 0.0
+_init_lock = Lock()
+_prune_lock = Lock()
+_last_prune: dict[str, float] = {}
 
 
 def enabled() -> bool:
@@ -65,17 +69,31 @@ def fingerprint(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
-def _conn() -> sqlite3.Connection:
-    path = config.DB_PATH
-    if path not in _inited:
+def _initialize(path: str) -> None:
+    if not _init_lock.acquire(timeout=DB_BUSY_TIMEOUT_S):
+        raise sqlite3.OperationalError("Gemini store initialization is busy")
+    try:
+        if path in _inited:
+            return
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with closing(sqlite3.connect(path, timeout=10)) as c:
-            c.execute("PRAGMA journal_mode=WAL")
-            c.executescript(_SCHEMA)
+        with closing(sqlite3.connect(path, timeout=DB_BUSY_TIMEOUT_S)) as c:
+            c.execute("PRAGMA journal_mode=WAL").fetchone()
+            # Hold the SQLite write lock across the schema check/upgrade, even across processes.
+            c.executescript("BEGIN IMMEDIATE;\n" + _SCHEMA)
+            columns = c.execute("PRAGMA table_info(gemini_keys)").fetchall()
+            if not any(column[1] == "operator_version" for column in columns):
+                c.execute("ALTER TABLE gemini_keys ADD COLUMN operator_version INTEGER NOT NULL DEFAULT 0")
             c.execute("DELETE FROM request_log WHERE ts < ?", (time.time() - LOG_RETENTION_S,))
             c.commit()
         _inited.add(path)
-    c = sqlite3.connect(path, timeout=10)
+    finally:
+        _init_lock.release()
+
+
+def _conn() -> sqlite3.Connection:
+    path = config.DB_PATH
+    _initialize(path)
+    c = sqlite3.connect(path, timeout=DB_BUSY_TIMEOUT_S)
     c.row_factory = sqlite3.Row
     return c
 
@@ -135,33 +153,52 @@ def set_status(key_id: int, status: str) -> None:
     """Admin enable/disable/reject. Enabling also clears cooldown and failures."""
     if status == "active":
         _x("UPDATE gemini_keys SET status='active', cooldown_until=0, consecutive_failures=0,"
-           " last_error=NULL WHERE id=?", (key_id,))
+           " last_error=NULL, operator_version=operator_version+1 WHERE id=?", (key_id,))
     else:
-        _x("UPDATE gemini_keys SET status=? WHERE id=?", (status, key_id))
+        _x("UPDATE gemini_keys SET status=?, operator_version=operator_version+1 WHERE id=?",
+           (status, key_id))
 
 
-def mark_rejected(key_id: int, error: str) -> None:
-    _x("UPDATE gemini_keys SET status='rejected', last_error=? WHERE id=? AND status='active'",
-       (error[:200], key_id))
+def restore_rejected(key_id: int, operator_version: int) -> bool:
+    """Restore only a still-rejected key with no intervening operator action."""
+    return _x("UPDATE gemini_keys SET status='active', cooldown_until=0, consecutive_failures=0,"
+              " last_error=NULL WHERE id=? AND status='rejected' AND operator_version=?",
+              (key_id, operator_version)) == 1
 
 
-def mark_ok(key_id: int) -> None:
-    _x("UPDATE gemini_keys SET consecutive_failures=0, cooldown_until=0, last_used_at=? WHERE id=?",
-       (time.time(), key_id))
+_ACTIVE_KEY = " WHERE id=? AND status='active' AND operator_version=COALESCE(?, operator_version)"
 
 
-def mark_cooldown(key_id: int, error: str, retry_after: float | None) -> float:
-    """Start or extend a cooldown; returns its length in seconds."""
-    rows = _q("SELECT consecutive_failures FROM gemini_keys WHERE id=?", (key_id,))
-    failures = (rows[0]["consecutive_failures"] if rows else 0) + 1
-    if retry_after is not None and retry_after > 0:
-        secs = min(retry_after, COOLDOWN_MAX_S)
-    else:
-        secs = min(COOLDOWN_BASE_S * 2 ** (failures - 1), COOLDOWN_MAX_S)
-    _x("UPDATE gemini_keys SET consecutive_failures=?, cooldown_until=?, last_error=?,"
-       " last_used_at=? WHERE id=?",
-       (failures, time.time() + secs, error[:200], time.time(), key_id))
-    return secs
+def mark_rejected(key_id: int, error: str, *, operator_version: int | None = None) -> None:
+    _x("UPDATE gemini_keys SET status='rejected', last_error=?" + _ACTIVE_KEY,
+       (error[:200], key_id, operator_version))
+
+
+def mark_ok(key_id: int, *, operator_version: int | None = None) -> None:
+    _x("UPDATE gemini_keys SET consecutive_failures=0, cooldown_until=0, last_used_at=?" + _ACTIVE_KEY,
+       (time.time(), key_id, operator_version))
+
+
+def mark_cooldown(key_id: int, error: str, retry_after: float | None, *,
+                  operator_version: int | None = None) -> float:
+    """Start or extend a cooldown; returns the delay, or zero if the key was skipped."""
+    with closing(_conn()) as c, c:
+        # Serialize the read of the failure count with the write to avoid losing increments.
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT consecutive_failures FROM gemini_keys" + _ACTIVE_KEY,
+                        (key_id, operator_version)).fetchone()
+        if row is None:
+            return 0.0
+        failures = row["consecutive_failures"]
+        if retry_after is not None and retry_after > 0:
+            secs = min(retry_after, COOLDOWN_MAX_S)
+        else:
+            secs = min(COOLDOWN_BASE_S * 2 ** min(failures, 30), COOLDOWN_MAX_S)
+        now = time.time()
+        c.execute("UPDATE gemini_keys SET consecutive_failures=consecutive_failures+1,"
+                  " cooldown_until=?, last_error=?, last_used_at=? WHERE id=?",
+                  (now + secs, error[:200], now, key_id))
+        return secs
 
 
 def usable_keys() -> list[sqlite3.Row]:
@@ -190,13 +227,17 @@ def pool_counts() -> dict[str, int]:
 def log_request(route: str, model: str | None, key_id: int | None, status: int,
                 latency_ms: int, attempts: int,
                 prompt_tokens: int | None = None, output_tokens: int | None = None) -> None:
-    global _last_prune
+    path = config.DB_PATH
     now = time.time()
     _x("INSERT INTO request_log VALUES (?,?,?,?,?,?,?,?,?)",
        (now, route, model, key_id, status, latency_ms, attempts, prompt_tokens, output_tokens))
-    if now - _last_prune > 3600:
-        _last_prune = now
-        _x("DELETE FROM request_log WHERE ts < ?", (now - LOG_RETENTION_S,))
+    if _prune_lock.acquire(blocking=False):
+        try:
+            if now - _last_prune.get(path, 0.0) > 3600:
+                _x("DELETE FROM request_log WHERE ts < ?", (now - LOG_RETENTION_S,))
+                _last_prune[path] = now
+        finally:
+            _prune_lock.release()
 
 
 def recent_requests(limit: int = 100) -> list[sqlite3.Row]:
@@ -213,7 +254,3 @@ def key_stats_24h() -> dict[int, dict[str, int]]:
     rows = _q("SELECT key_id, COUNT(*) n, SUM(status>=400) e FROM request_log"
               " WHERE ts>=? AND key_id IS NOT NULL GROUP BY key_id", (time.time() - 86400,))
     return {r["key_id"]: {"requests": r["n"], "failures": r["e"] or 0} for r in rows}
-
-
-def row_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return {k: row[k] for k in row.keys() if k != "ciphertext"}
