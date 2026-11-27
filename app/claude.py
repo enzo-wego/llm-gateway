@@ -82,6 +82,8 @@ def _options(
         tools=[],
         allowed_tools=[],
         setting_sources=[],
+        # The gateway never resumes sessions; the transcripts filled the Docker disk.
+        extra_args={"no-session-persistence": None},
         max_turns=_MAX_TURNS,
         effort=effort,
         thinking={"type": thinking},
@@ -205,6 +207,7 @@ async def _run(prompt: Any, options: sdk.ClaudeAgentOptions) -> dict[str, Any]:
         raise QuotaExhausted(meta.get("rate_limit", {}).get("type") or "quota")
     if fatal:
         raise ClaudeError(fatal)
+    alerts.on_claude_ok()
 
     if structured is None:
         joined = "".join(text_parts).strip()

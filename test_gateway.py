@@ -30,9 +30,13 @@ os.environ.setdefault("LLM_GATEWAY_API_KEY", "test")
 os.environ.setdefault("OPENROUTER_API_KEY", "sk-or-test")
 
 import httpx  # noqa: E402
-from app import alerts, claude, config, main, openrouter  # noqa: E402
+from app import alerts, claude, config, gemini, main, openrouter  # noqa: E402
 from app.main import _Quota, _tier_config, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+
+# Several embed tests replace openrouter._post without restoring it.
+_REAL_OPENROUTER_POST = openrouter._post
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 
 def _isolate_alert_globals() -> None:
@@ -82,6 +86,26 @@ def captured_gateway_logs():
         main.log.setLevel(original_level)
 
 
+@contextmanager
+def captured_gemini_logs():
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = Capture()
+    logger = logging.getLogger("llm-gateway.gemini")
+    original_level = logger.level
+    logger.setLevel(logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(original_level)
+
+
 def test_claude_unwraps_entire_fenced_block() -> None:
     cases = [
         ("fenced JSON", '```json\n{"ok":true}\n```', '{"ok":true}'),
@@ -112,7 +136,7 @@ def test_embed_reorders_by_index() -> None:
     """A response whose rows arrive shuffled must still come back in input order."""
     captured: dict = {}
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         captured["inputs"] = payload["input"]
         # Deliberately out of order, each row tagged with its true index.
         return {"data": [
@@ -129,7 +153,7 @@ def test_embed_reorders_by_index() -> None:
 
 def test_embed_rejects_bad_index() -> None:
     """An out-of-range index must raise, never silently drop or misplace a row."""
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         return {"data": [{"index": 7, "embedding": [1.0]}]}
 
     openrouter._post = fake_post
@@ -142,7 +166,7 @@ def test_embed_rejects_bad_index() -> None:
 
 def test_embed_rejects_count_mismatch() -> None:
     """Fewer vectors than inputs must raise rather than return a short list."""
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         return {"data": [{"index": 0, "embedding": [1.0]}]}
 
     openrouter._post = fake_post
@@ -157,7 +181,7 @@ def test_embed_chunks_large_batches() -> None:
     """Inputs beyond the per-call cap are split, and order survives the split."""
     calls: list[int] = []
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         n = len(payload["input"])
         calls.append(n)
         base = sum(calls[:-1])
@@ -217,6 +241,8 @@ def test_options_pass_tier_thinking_to_the_sdk() -> None:
     # as configured instead of being pinned to disabled.
     assert claude._options("m", "medium", "adaptive", "", None).thinking == {"type": "adaptive"}
     assert claude._options("m", "low", "disabled", "", None).thinking == {"type": "disabled"}
+    opts = claude._options("m", "medium", "adaptive", "", None)
+    assert "no-session-persistence" in opts.extra_args and opts.extra_args["no-session-persistence"] is None
 
 
 def test_api_key_is_unset_at_import() -> None:
@@ -306,7 +332,7 @@ def test_openrouter_generate_honours_schema_and_returns_output() -> None:
     captured: dict = {}
     original = openrouter._post
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         captured["payload"] = payload
         return {"choices": [{"message": {"content": '{"code":"13.1"}'}}], "usage": {}}
 
@@ -334,7 +360,7 @@ def test_openrouter_generate_max_tokens_is_configurable() -> None:
     original = openrouter._post
     old = config.OR_MAX_TOKENS
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         captured["max_tokens"] = payload["max_tokens"]
         return {"choices": [{"message": {"content": "{}"}}]}
 
@@ -362,7 +388,7 @@ def test_describe_sends_pdfs_as_documents_and_images_as_images() -> None:
     sent: list = []
     original_post, original_guarded = openrouter._post, claude._guarded
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         sent.append(payload["messages"][0]["content"][1])
         return {"choices": [{"message": {"content": "ok"}}]}
 
@@ -396,7 +422,7 @@ def test_openrouter_describe_max_tokens_is_configurable() -> None:
     original = openrouter._post
     old = config.OR_MAX_TOKENS_DESCRIBE
 
-    async def fake_post(path, payload, timeout):
+    async def fake_post(path, payload, timeout, **_):
         captured["max_tokens"] = payload["max_tokens"]
         return {"choices": [{"message": {"content": "{}"}}]}
 
@@ -948,7 +974,9 @@ def test_generate_logs_each_outcome_once() -> None:
         duration = next(part for part in message.split() if part.startswith("duration_ms="))
         assert duration.removeprefix("duration_ms=").isdigit(), message
 
+    original_callers = main.callers
     try:
+        main.callers = {}
         main.quota = _Quota()
         config.BACKEND_CHEAP = "claude"
         config.MODEL_CHEAP = "claude-model"
@@ -1000,7 +1028,9 @@ def test_generate_logs_each_outcome_once() -> None:
             claude.generate = blocked
             config.BACKEND_CHEAP = "claude"
             config.FALLBACK_ON_QUOTA = False
-            task = asyncio.create_task(main.generate(main.GenerateIn(user="prompt", tier="cheap")))
+            task = asyncio.create_task(
+                main.generate(main.GenerateIn(user="prompt", tier="cheap"), caller="test/cancel")
+            )
             await started.wait()
             task.cancel()
             try:
@@ -1013,12 +1043,16 @@ def test_generate_logs_each_outcome_once() -> None:
             asyncio.run(cancel_generate())
         assert_log(
             records,
+            "caller=test/cancel",
             "backend=claude",
             "model=claude-model",
             "status=cancelled",
             "reason=external_cancelled",
         )
+        assert main.callers["test/cancel"]["calls"] == 1
+        assert main.callers["test/cancel"]["errors"] == 1
     finally:
+        main.callers = original_callers
         claude.generate = original_claude_generate
         openrouter.generate = original_openrouter_generate
         main.quota = original_quota
@@ -1041,6 +1075,7 @@ class _AlertCtl:
         self.now = 1000.0
         self.resp = {"ok": True}
         self.yield_in_post = False
+        self.gate: asyncio.Event | None = None
 
 
 @contextmanager
@@ -1072,6 +1107,8 @@ def isolated_alerts(posts: list):
         async def post(self, *a, **k):
             if ctl.yield_in_post:
                 await asyncio.sleep(0)
+            if ctl.gate is not None:
+                await ctl.gate.wait()
             if isinstance(ctl.resp, httpx.ConnectError):
                 raise ctl.resp
             posts.append(k.get("json"))
@@ -1308,6 +1345,1575 @@ def test_alert_non_quota_alerts_unchanged() -> None:
         ctl.now = 2801.0
         asyncio.run(alerts.on_openrouter_error(429, ""))
         assert len(posts) == 2
+
+
+# ── caller label ─────────────────────────────────────────────────────────────
+
+
+@contextmanager
+def caller_env(backend_describe: str = "claude", fallback: bool = True):
+    """Fresh caller store + quota, config and backend stubs; everything restored after."""
+    saved = (
+        main.callers, main.quota, claude.generate, claude.describe,
+        openrouter.generate, openrouter.describe, openrouter.embed, openrouter.key_usage,
+        config.BACKEND_CHEAP, config.BACKEND_DESCRIBE, config.FALLBACK_ON_QUOTA,
+    )
+    main.callers = {}
+    main.quota = _Quota()
+    config.BACKEND_CHEAP = "claude"
+    config.BACKEND_DESCRIBE = backend_describe
+    config.FALLBACK_ON_QUOTA = fallback
+
+    async def ok_claude(**kw):
+        return {"text": "ok", "meta": {"cost_usd": 0.01}}
+
+    async def ok_or(**kw):
+        return {"text": "ok", "meta": {}}
+
+    async def ok_embed(texts, dims):
+        return [[0.0]] * len(texts)
+
+    async def usage_stub():
+        return {"limit": 10, "usage": 1}
+
+    claude.generate = ok_claude
+    claude.describe = ok_claude
+    openrouter.generate = ok_or
+    openrouter.describe = ok_or
+    openrouter.embed = ok_embed
+    openrouter.key_usage = usage_stub
+    try:
+        yield
+    finally:
+        (
+            main.callers, main.quota, claude.generate, claude.describe,
+            openrouter.generate, openrouter.describe, openrouter.embed, openrouter.key_usage,
+            config.BACKEND_CHEAP, config.BACKEND_DESCRIBE, config.FALLBACK_ON_QUOTA,
+        ) = saved
+
+
+def _post(path: str, body: dict, caller: str | None = None, raise_exc: bool = True):
+    headers = {"X-API-Key": config.API_KEY}
+    if caller is not None:
+        headers["X-LLM-Caller"] = caller
+    return TestClient(app, raise_server_exceptions=raise_exc).post(path, headers=headers, json=body)
+
+
+GEN = {"user": "p", "tier": "cheap"}
+DESC = {"prompt": "p", "mime": "image/png", "data_b64": "AAAA"}
+
+
+def _summaries(records, name: str) -> list[str]:
+    return [r.getMessage() for r in records if r.getMessage().startswith(f"{name} caller=")]
+
+
+def test_caller_generate_labelled_and_counted() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        assert _post("/generate", GEN, "p-agent/bot-comment").status_code == 200
+        (msg,) = _summaries(records, "generate")
+        assert "caller=p-agent/bot-comment" in msg and "status=200" in msg
+        c = main.callers["p-agent/bot-comment"]
+        assert (c["calls"], c["errors"], c["cost_usd"]) == (1, 0, 0.01)
+        _post("/generate", GEN)
+        assert main.callers["unknown"]["calls"] == 1
+
+
+def test_caller_invalid_labels_become_unknown() -> None:
+    bad = ["P-Agent", "has space", "/lead", "a" * 65]
+    with caller_env(), captured_gateway_logs() as records:
+        for value in bad + [""]:
+            assert _post("/generate", GEN, value).status_code == 200
+        msgs = _summaries(records, "generate")
+        assert len(msgs) == 5 and all("caller=unknown" in m for m in msgs)
+        assert not any("caller= " in m for m in msgs)
+        for r in records:
+            text = r.getMessage() + repr(r.args)
+            assert not any(v in text for v in bad)
+        assert main.callers["unknown"]["calls"] == 5
+
+
+def test_caller_generate_error_counted() -> None:
+    with caller_env(fallback=False), captured_gateway_logs() as records:
+        _post("/generate", GEN, "x")
+
+        async def fail(**kw):
+            raise claude.ClaudeError("boom")
+
+        claude.generate = fail
+        assert _post("/generate", GEN, "x").status_code == 502
+        msgs = _summaries(records, "generate")
+        assert len(msgs) == 2 and "status=502" in msgs[1]
+        c = main.callers["x"]
+        assert c["calls"] == 2 and c["errors"] == 1 and round(c["cost_usd"], 4) == 0.01
+
+
+def test_caller_describe_outcomes() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        # 5: claude ok
+        async def cl(**kw):
+            return {"text": "ok", "meta": {"cost_usd": 0.002}}
+
+        claude.describe = cl
+        assert _post("/describe", DESC, "d").status_code == 200
+        (msg,) = _summaries(records, "describe")
+        assert "backend=claude mime=image/png status=200 reason=none" in msg
+        assert main.callers["d"]["cost_usd"] == 0.002
+
+    # 6: openrouter direct
+    with caller_env("openrouter"), captured_gateway_logs() as records:
+        assert _post("/describe", DESC, "d").status_code == 200
+        (msg,) = _summaries(records, "describe")
+        assert "backend=openrouter" in msg and "status=200" in msg
+        assert main.callers["d"]["cost_usd"] == 0
+
+    # 7: claude error, fallback ok, plus the diagnostic
+    with caller_env(), captured_gateway_logs() as records:
+        async def fail(**kw):
+            raise claude.ClaudeError("boom")
+
+        claude.describe = fail
+        assert _post("/describe", DESC, "d").status_code == 200
+        (msg,) = _summaries(records, "describe")
+        assert "backend=openrouter" in msg and "status=200 reason=claude_error" in msg
+        assert any("claude describe failed" in r.getMessage() for r in records)
+        c = main.callers["d"]
+        assert (c["calls"], c["errors"], c["cost_usd"]) == (1, 0, 0)
+
+    # 8: seat pre-blocked
+    with caller_env(), captured_gateway_logs() as records:
+        main.quota.blocked_until = 4e12
+        assert _post("/describe", DESC, "d").status_code == 200
+        (msg,) = _summaries(records, "describe")
+        assert "reason=seat_unavailable" in msg and "status=200" in msg
+        assert main.callers["d"]["calls"] == 1
+
+    # 9: openrouter error
+    with caller_env("openrouter"), captured_gateway_logs() as records:
+        async def fail(**kw):
+            raise openrouter.OpenRouterError("boom")
+
+        openrouter.describe = fail
+        assert _post("/describe", DESC, "d").status_code == 502
+        (msg,) = _summaries(records, "describe")
+        assert "status=502 reason=openrouter_error" in msg
+        assert (main.callers["d"]["calls"], main.callers["d"]["errors"]) == (1, 1)
+
+
+def test_caller_describe_mime_cannot_forge_log() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        body = {**DESC, "mime": "image/png\nforged caller=x"}
+        _post("/describe", body, "d")
+        (msg,) = _summaries(records, "describe")
+        assert "mime=invalid" in msg and "\n" not in msg and "\r" not in msg
+        assert "forged" not in msg
+        assert main.callers["d"]["calls"] == 1
+
+
+def test_caller_embed() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        assert _post("/embed", {"texts": ["a", "b"]}, "e").status_code == 200
+        assert _post("/embed", {"texts": []}, "e").status_code == 200
+        assert _post("/embed", {"texts": ["a", ""]}, "e").status_code == 422
+
+        async def fail(texts, dims):
+            raise openrouter.OpenRouterError("boom")
+
+        openrouter.embed = fail
+        assert _post("/embed", {"texts": ["a"]}, "e").status_code == 502
+        msgs = _summaries(records, "embed")
+        assert len(msgs) == 3
+        assert "texts=2 status=200" in msgs[0]
+        assert "texts=0 status=200" in msgs[1]
+        assert "status=502 reason=openrouter_error" in msgs[2]
+        assert (main.callers["e"]["calls"], main.callers["e"]["errors"]) == (3, 1)
+
+
+def test_caller_unexpected_exception() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        async def boom(**kw):
+            raise RuntimeError("boom")
+
+        claude.generate = boom
+        assert _post("/generate", GEN, "u", raise_exc=False).status_code == 500
+        (msg,) = _summaries(records, "generate")
+        assert "status=500 reason=unexpected_error" in msg
+        assert (main.callers["u"]["calls"], main.callers["u"]["errors"]) == (1, 1)
+
+
+def test_caller_rejected_requests_not_counted() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        r = TestClient(app).post("/generate", headers={"X-API-Key": "wrong"}, json=GEN)
+        assert r.status_code == 401
+        assert _post("/generate", {"tier": "cheap"}, "x").status_code == 422
+        assert _summaries(records, "generate") == []
+        assert main.callers == {}
+
+
+def test_caller_cost_rules_and_rounding() -> None:
+    with caller_env():
+        for cost in ("x", None):
+            async def cl(cost=cost, **kw):
+                meta = {} if cost is None else {"cost_usd": cost}
+                return {"text": "ok", "meta": meta}
+
+            claude.generate = cl
+            _post("/generate", GEN, "c")
+        assert main.callers["c"]["cost_usd"] == 0
+
+        async def tiny(**kw):
+            return {"text": "ok", "meta": {"cost_usd": 0.00001}}
+
+        claude.generate = tiny
+        for _ in range(3):
+            _post("/generate", GEN, "tiny")
+
+        async def big(**kw):
+            return {"text": "ok", "meta": {"cost_usd": 0.12345}}
+
+        claude.generate = big
+        _post("/generate", GEN, "big")
+        callers = TestClient(app).get("/usage", headers={"X-API-Key": config.API_KEY}).json()["callers"]
+        assert callers["tiny"]["notional_cost_usd"] == 0.0
+        assert callers["big"]["notional_cost_usd"] == 0.1235
+        assert callers["c"]["notional_cost_usd"] == 0
+
+
+def test_caller_bucket_limit() -> None:
+    with caller_env(), captured_gateway_logs() as records:
+        for i in range(64):
+            _post("/generate", GEN, f"c{i}")
+        _post("/generate", GEN, "late")
+        _post("/generate", GEN, "c0")
+        _post("/generate", GEN)
+        _post("/generate", GEN, "other")
+        assert "caller=late" in _summaries(records, "generate")[64]
+        assert "late" not in main.callers
+        assert main.callers["other"]["calls"] == 2
+        assert main.callers["c0"]["calls"] == 2
+        assert main.callers["unknown"]["calls"] == 1
+        assert len(main.callers) == 66
+
+
+def test_usage_reports_callers_sorted() -> None:
+    with caller_env():
+        _post("/generate", GEN, "zeta")
+        _post("/generate", GEN, "alpha")
+        body = TestClient(app).get("/usage", headers={"X-API-Key": config.API_KEY}).json()
+        assert list(body["callers"]) == ["alpha", "zeta"]
+        assert set(body["callers"]["alpha"]) == {"calls", "errors", "notional_cost_usd"}
+        assert set(body["seat"]) == {
+            "available", "last_rate_limit", "calls", "notional_cost_usd", "openrouter_fallbacks",
+        }
+        assert set(body["openrouter"]) >= {"limit", "usage", "limit_remaining"}
+
+
+def _openrouter_returning(statuses: list[int]):
+    """Swap openrouter's HTTP client for one that answers with these statuses in order."""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = statuses[len(calls)]
+        calls.append(status)
+        return httpx.Response(status, json={"data": [{"index": 0, "embedding": [0.1]}]})
+
+    transport = httpx.MockTransport(handler)
+    openrouter.httpx.AsyncClient = lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+    return calls
+
+
+def test_openrouter_429_is_retried_before_alerting() -> None:
+    sent: list[int] = []
+
+    async def fake_alert(status: int, body: str, path: str = "", cap: bool = False) -> None:
+        sent.append(status)
+
+    original = openrouter._post, openrouter._RETRY_429_DELAYS_S, alerts.on_openrouter_error
+    openrouter._post = _REAL_OPENROUTER_POST
+    openrouter._RETRY_429_DELAYS_S = (0, 0, 0)
+    alerts.on_openrouter_error = fake_alert
+    try:
+        # A 429 that clears on retry succeeds and stays off Slack.
+        calls = _openrouter_returning([429, 429, 200])
+        assert asyncio.run(openrouter.embed(["a"], 1)) == [[0.1]]
+        assert calls == [429, 429, 200] and sent == []
+
+        # One that survives every retry fails and alerts exactly once.
+        calls = _openrouter_returning([429] * 4)
+        try:
+            asyncio.run(openrouter.embed(["a"], 1))
+            raise AssertionError("expected OpenRouterError")
+        except openrouter.OpenRouterError:
+            pass
+        assert len(calls) == 4 and sent == [429]
+
+        # Other errors are not retried.
+        calls = _openrouter_returning([402])
+        try:
+            asyncio.run(openrouter.embed(["a"], 1))
+        except openrouter.OpenRouterError:
+            pass
+        assert calls == [402]
+
+        # Generate does not retry: its 180 s timeout leaves no room under the
+        # caller's 200 s.
+        calls = _openrouter_returning([429, 200])
+        try:
+            asyncio.run(openrouter.generate(system="", user="u", model="m"))
+            raise AssertionError("expected OpenRouterError")
+        except openrouter.OpenRouterError:
+            pass
+        assert calls == [429]
+    finally:
+        openrouter.httpx.AsyncClient = _REAL_ASYNC_CLIENT
+        openrouter._post, openrouter._RETRY_429_DELAYS_S, alerts.on_openrouter_error = original
+
+
+
+
+GEMINI_DUMMY_KEY = "GEMINI-DUMMY-7f3a"
+
+
+@contextmanager
+def gemini_fallback_env():
+    saved = (
+        config.GEMINI_API_KEY, config.EMBED_MAX_BATCH,
+        openrouter.embed, gemini.embed, alerts.on_gemini_error,
+    )
+    config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+    config.EMBED_MAX_BATCH = 96
+    try:
+        yield
+    finally:
+        (
+            config.GEMINI_API_KEY, config.EMBED_MAX_BATCH,
+            openrouter.embed, gemini.embed, alerts.on_gemini_error,
+        ) = saved
+
+
+@contextmanager
+def gemini_transport(responses):
+    calls: list[httpx.Request] = []
+    sleeps: list[float] = []
+    original_client = gemini.httpx.AsyncClient
+    original_sleep = asyncio.sleep
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        value = responses[len(calls) - 1]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    transport = httpx.MockTransport(handler)
+    gemini.httpx.AsyncClient = lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+    asyncio.sleep = record_sleep
+    try:
+        yield calls, sleeps
+    finally:
+        gemini.httpx.AsyncClient = original_client
+        asyncio.sleep = original_sleep
+
+
+@contextmanager
+def recorded_sleeps():
+    sleeps: list[float] = []
+    original_sleep = asyncio.sleep
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    asyncio.sleep = record_sleep
+    try:
+        yield sleeps
+    finally:
+        asyncio.sleep = original_sleep
+
+
+def test_embed_falls_back_for_cap_statuses_and_full_403_body() -> None:
+    cases = [
+        (402, "spent"),
+        (403, "Key limit exceeded"),
+        (403, "x" * 401 + "Key limit exceeded"),
+    ]
+    for status, body in cases:
+        with gemini_fallback_env(), captured_gateway_logs() as records:
+            original_post = openrouter._post
+            original_client = openrouter.httpx.AsyncClient
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(status, text=body)
+
+            transport = httpx.MockTransport(handler)
+            openrouter._post = _REAL_OPENROUTER_POST
+            openrouter.httpx.AsyncClient = (
+                lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+            )
+
+            async def fallback(texts, dims):
+                return [[float(i)] for i, _ in enumerate(texts)]
+
+            gemini.embed = fallback
+            try:
+                response = _post("/embed", {"texts": ["a", "b"], "dims": 1}, "fallback")
+            finally:
+                openrouter._post = original_post
+                openrouter.httpx.AsyncClient = original_client
+            assert response.status_code == 200
+            assert response.json()["embeddings"] == [[0.0], [1.0]]
+            assert _summaries(records, "embed")[0].endswith("backend=gemini")
+
+
+def test_embed_gemini_retry_recovers_without_alerting() -> None:
+    alerted: list[str] = []
+    with gemini_fallback_env(), captured_gateway_logs() as records:
+        async def primary(texts, dims):
+            raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+        async def capture(message: str) -> None:
+            alerted.append(message)
+
+        openrouter.embed = primary
+        gemini.embed = __import__("app.gemini", fromlist=["embed"]).embed
+        alerts.on_gemini_error = capture
+        with gemini_transport([httpx.Response(503, text="temporary"), _gemini_ok([1.0])]) as (
+            calls,
+            sleeps,
+        ):
+            response = _post("/embed", {"texts": ["a"], "dims": 1}, "retry")
+
+        assert response.status_code == 200
+        assert response.json()["embeddings"] == [[1.0]]
+        assert len(calls) == 2
+        assert [delay for delay in sleeps if delay] == [1]
+        assert alerted == []
+        summary = _summaries(records, "embed")[0]
+        assert "status=200" in summary
+        assert summary.endswith("backend=gemini")
+
+
+def test_embed_gemini_retry_exhaustion_alerts_once() -> None:
+    alerted: list[str] = []
+    with gemini_fallback_env(), captured_gateway_logs() as records:
+        async def primary(texts, dims):
+            raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+        async def capture(message: str) -> None:
+            alerted.append(message)
+
+        openrouter.embed = primary
+        gemini.embed = __import__("app.gemini", fromlist=["embed"]).embed
+        alerts.on_gemini_error = capture
+        responses = [httpx.Response(503, text="temporary")] * 4
+        with gemini_transport(responses) as (calls, sleeps):
+            response = _post("/embed", {"texts": ["a"], "dims": 1}, "retry")
+
+        assert response.status_code == 502
+        detail = response.json()["detail"]
+        assert "OpenRouter 402: spent" in detail
+        assert "fallback: Gemini 503: temporary" in detail
+        assert len(calls) == 4
+        assert [delay for delay in sleeps if delay] == [1, 2, 4]
+        assert len(alerted) == 1
+        summary = _summaries(records, "embed")[0]
+        assert "reason=gemini_error" in summary
+        assert "status=502" in summary
+
+
+def test_embed_fallback_false_returns_openrouter_cap_error() -> None:
+    with gemini_fallback_env(), captured_gateway_logs() as records:
+        called = False
+
+        async def fail(texts, dims):
+            raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+        async def forbidden(texts, dims):
+            nonlocal called
+            called = True
+            return []
+
+        openrouter.embed = fail
+        gemini.embed = forbidden
+        response = _post(
+            "/embed",
+            {"texts": ["a"], "fallback": False},
+            "optout",
+        )
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == "OpenRouter 402: spent"
+        assert not called
+        summary = _summaries(records, "embed")[0]
+        assert "reason=openrouter_error" in summary
+        assert summary.endswith("backend=openrouter")
+
+
+def test_embed_fallback_false_keeps_openrouter_success() -> None:
+    with gemini_fallback_env(), captured_gateway_logs() as records:
+        called = False
+
+        async def primary(texts, dims):
+            return [[1.0]]
+
+        async def forbidden(texts, dims):
+            nonlocal called
+            called = True
+            return []
+
+        openrouter.embed = primary
+        gemini.embed = forbidden
+        response = _post(
+            "/embed",
+            {"texts": ["a"], "dims": 1, "fallback": False},
+            "optout",
+        )
+
+        assert response.status_code == 200
+        assert response.json()["embeddings"] == [[1.0]]
+        assert not called
+        assert _summaries(records, "embed")[0].endswith("backend=openrouter")
+
+
+def test_embed_does_not_fallback_for_auth_errors_or_openrouter_success() -> None:
+    for err in (
+        openrouter.OpenRouterError("OpenRouter 401", status=401),
+        openrouter.OpenRouterError("OpenRouter 403", status=403),
+    ):
+        with gemini_fallback_env():
+            called = False
+
+            async def fail(texts, dims, error=err):
+                raise error
+
+            async def forbidden(texts, dims):
+                nonlocal called
+                called = True
+                return []
+
+            openrouter.embed = fail
+            gemini.embed = forbidden
+            assert _post("/embed", {"texts": ["a"]}, "auth").status_code == 502
+            assert not called
+
+    with gemini_fallback_env(), captured_gateway_logs() as records:
+        called = False
+
+        async def primary(texts, dims):
+            return [[1.0]]
+
+        async def forbidden(texts, dims):
+            nonlocal called
+            called = True
+            return []
+
+        openrouter.embed = primary
+        gemini.embed = forbidden
+        assert _post("/embed", {"texts": ["a"], "dims": 1}, "primary").status_code == 200
+        assert not called
+        assert _summaries(records, "embed")[0].endswith("backend=openrouter")
+
+
+def test_embed_cap_without_key_does_not_fallback_and_alert_explains_recovery() -> None:
+    with gemini_fallback_env():
+        config.GEMINI_API_KEY = ""
+        called = False
+
+        async def fail(texts, dims):
+            raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+        async def forbidden(texts, dims):
+            nonlocal called
+            called = True
+            return []
+
+        openrouter.embed = fail
+        gemini.embed = forbidden
+        assert _post("/embed", {"texts": ["a"]}, "no-key").status_code == 502
+        assert not called
+
+    posts: list = []
+    with isolated_alerts(posts):
+        config.GEMINI_API_KEY = ""
+        asyncio.run(alerts.on_openrouter_error(
+            402, "spent", path="/embeddings", cap=True
+        ))
+        assert "set GEMINI_API_KEY or raise the cap" in posts[0]["text"]
+
+
+def _gemini_ok(values=None) -> httpx.Response:
+    return httpx.Response(200, json={"embeddings": [{"values": values or [0.1]}]})
+
+
+def _retry_warnings(records: list[logging.LogRecord]) -> list[str]:
+    return [
+        record.getMessage() for record in records
+        if record.levelno == logging.WARNING and "retrying in" in record.getMessage()
+    ]
+
+
+def test_gemini_retryable_statuses_recover_and_exhaust() -> None:
+    for status in (429, 500, 502, 503, 504):
+        with gemini_fallback_env(), captured_gemini_logs() as records:
+            responses = [httpx.Response(status, text="temporary"), _gemini_ok()]
+            with gemini_transport(responses) as (calls, sleeps):
+                assert asyncio.run(gemini.embed(["a"], 1)) == [[0.1]]
+            assert len(calls) == 2
+            assert sleeps == [1]
+            warnings = _retry_warnings(records)
+            assert len(warnings) == 1
+            assert warnings[0] == f"Gemini {status} on embed, retrying in 1.0s"
+
+        with gemini_fallback_env(), captured_gemini_logs() as records:
+            with gemini_transport([httpx.Response(status, text="temporary")] * 4) as (calls, sleeps):
+                try:
+                    asyncio.run(gemini.embed(["a"], 1))
+                    raise AssertionError("expected GeminiError")
+                except gemini.GeminiError as exc:
+                    assert str(exc).startswith(f"Gemini {status}:")
+            assert len(calls) == 4
+            assert sleeps == [1, 2, 4]
+            assert len(_retry_warnings(records)) == 3
+
+
+def test_gemini_retry_after_contract() -> None:
+    cases = [
+        (429, "3", 3),
+        (503, "3", 3),
+        (429, "99", 10),
+        (500, "3", 1),
+    ]
+    for status, retry_after, expected in cases:
+        responses = [
+            httpx.Response(status, headers={"Retry-After": retry_after}),
+            _gemini_ok(),
+        ]
+        with gemini_fallback_env(), captured_gemini_logs() as records:
+            with gemini_transport(responses) as (calls, sleeps):
+                assert asyncio.run(gemini.embed(["a"], 1)) == [[0.1]]
+            assert len(calls) == 2
+            assert sleeps == [expected]
+            assert len(_retry_warnings(records)) == 1
+
+
+def test_gemini_transport_and_mixed_failures_share_retry_budget() -> None:
+    for failure in (httpx.ConnectError("down"), httpx.ReadTimeout("slow")):
+        with gemini_fallback_env(), captured_gemini_logs() as records:
+            with gemini_transport([failure, _gemini_ok()]) as (calls, sleeps):
+                assert asyncio.run(gemini.embed(["a"], 1)) == [[0.1]]
+            assert len(calls) == 2
+            assert sleeps == [1]
+            assert _retry_warnings(records) == [
+                f"Gemini transport error {type(failure).__name__} on embed, retrying in 1.0s"
+            ]
+
+    with gemini_fallback_env(), captured_gemini_logs() as records:
+        failures = [httpx.ConnectError("down")] * 4
+        with gemini_transport(failures) as (calls, sleeps):
+            try:
+                asyncio.run(gemini.embed(["a"], 1))
+                raise AssertionError("expected GeminiError")
+            except gemini.GeminiError as exc:
+                assert str(exc) == "Gemini transport error: ConnectError"
+        assert len(calls) == 4
+        assert sleeps == [1, 2, 4]
+        assert len(_retry_warnings(records)) == 3
+
+    mixed = [
+        httpx.Response(503),
+        httpx.ConnectError("down"),
+        httpx.Response(429),
+    ]
+    with gemini_fallback_env(), captured_gemini_logs() as records:
+        with gemini_transport([*mixed, _gemini_ok()]) as (calls, sleeps):
+            assert asyncio.run(gemini.embed(["a"], 1)) == [[0.1]]
+        assert len(calls) == 4
+        assert sleeps == [1, 2, 4]
+        assert len(_retry_warnings(records)) == 3
+
+    with gemini_fallback_env(), captured_gemini_logs() as records:
+        responses = [*mixed, httpx.Response(503, text="still down")]
+        with gemini_transport(responses) as (calls, sleeps):
+            try:
+                asyncio.run(gemini.embed(["a"], 1))
+                raise AssertionError("expected GeminiError")
+            except gemini.GeminiError as exc:
+                assert str(exc).startswith("Gemini 503:")
+        assert len(calls) == 4
+        assert sleeps == [1, 2, 4]
+        assert len(_retry_warnings(records)) == 3
+
+
+def test_gemini_non_retryable_and_invalid_responses_fail_once() -> None:
+    failures = [
+        *(httpx.Response(status, text="permanent") for status in (400, 401, 403, 404, 501, 505)),
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"embeddings": []}),
+        httpx.Response(200, json={"embeddings": [{"values": []}]}),
+    ]
+    for failure in failures:
+        with gemini_fallback_env(), captured_gemini_logs() as records:
+            with gemini_transport([failure]) as (calls, sleeps):
+                try:
+                    asyncio.run(gemini.embed(["a"], 1))
+                    raise AssertionError("expected GeminiError")
+                except gemini.GeminiError:
+                    pass
+            assert len(calls) == 1
+            assert sleeps == []
+            assert _retry_warnings(records) == []
+
+
+def test_gemini_retries_only_failed_chunk_and_preserves_order() -> None:
+    requests: list[list[str]] = []
+
+    def response_for(request: httpx.Request) -> httpx.Response:
+        texts = [
+            part["text"]
+            for item in json.loads(request.content)["requests"]
+            for part in item["content"]["parts"]
+        ]
+        requests.append(texts)
+        if len(requests) == 2:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"embeddings": [
+            {"values": [float(text.removeprefix("t"))]} for text in texts
+        ]})
+
+    responses = [response_for] * 3
+    calls: list[httpx.Request] = []
+    sleeps: list[float] = []
+    original_client = gemini.httpx.AsyncClient
+    original_sleep = asyncio.sleep
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return responses[len(calls) - 1](request)
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    transport = httpx.MockTransport(handler)
+    gemini.httpx.AsyncClient = lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+    asyncio.sleep = record_sleep
+    try:
+        with captured_gemini_logs() as records:
+            got = asyncio.run(gemini.embed([f"t{i}" for i in range(97)], 1))
+    finally:
+        gemini.httpx.AsyncClient = original_client
+        asyncio.sleep = original_sleep
+    assert requests == [
+        [f"t{i}" for i in range(96)],
+        ["t96"],
+        ["t96"],
+    ]
+    assert got == [[float(i)] for i in range(97)]
+    assert sleeps == [1]
+    assert _retry_warnings(records) == [
+        "Gemini 503 on embed, retrying in 1.0s"
+    ]
+
+
+def test_gemini_request_shape_chunking_and_order() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        body = json.loads(request.content)
+        start = sum(len(json.loads(c.content)["requests"]) for c in calls[:-1])
+        return httpx.Response(200, json={"embeddings": [
+            {"values": [float(start + i)]} for i in range(len(body["requests"]))
+        ]})
+
+    original = gemini.httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    gemini.httpx.AsyncClient = lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+    saved = config.GEMINI_API_KEY, config.EMBED_MAX_BATCH
+    config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+    config.EMBED_MAX_BATCH = 500
+    try:
+        got = asyncio.run(gemini.embed([f"t{i}" for i in range(200)], 1))
+        assert got == [[float(i)] for i in range(200)]
+        assert [len(json.loads(c.content)["requests"]) for c in calls] == [96, 96, 8]
+        for call in calls:
+            body = json.loads(call.content)
+            assert call.headers["x-goog-api-key"] == GEMINI_DUMMY_KEY
+            assert GEMINI_DUMMY_KEY not in call.url.query.decode()
+            assert all("taskType" not in r and r["outputDimensionality"] == 1 for r in body["requests"])
+    finally:
+        gemini.httpx.AsyncClient = original
+        config.GEMINI_API_KEY, config.EMBED_MAX_BATCH = saved
+
+
+def test_gemini_failures_include_both_errors_and_alert_once() -> None:
+    failures = [
+        httpx.Response(500, text="bad"),
+        httpx.ConnectTimeout("slow"),
+        httpx.Response(200, text="{"),
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"embeddings": []}),
+        httpx.Response(200, json={"embeddings": [{"values": []}]}),
+    ]
+    for failure in failures:
+        alerted: list[str] = []
+        with gemini_fallback_env():
+            original_client = gemini.httpx.AsyncClient
+
+            async def primary(texts, dims):
+                raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+            def handler(request: httpx.Request, value=failure) -> httpx.Response:
+                if isinstance(value, Exception):
+                    raise value
+                return value
+
+            transport = httpx.MockTransport(handler)
+            gemini.httpx.AsyncClient = (
+                lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+            )
+
+            async def capture(msg):
+                alerted.append(msg)
+
+            openrouter.embed = primary
+            gemini.embed = __import__("app.gemini", fromlist=["embed"]).embed
+            alerts.on_gemini_error = capture
+            try:
+                with recorded_sleeps():
+                    response = _post("/embed", {"texts": ["a"], "dims": 1}, "failure")
+            finally:
+                gemini.httpx.AsyncClient = original_client
+            assert response.status_code == 502
+            assert "OpenRouter 402" in response.json()["detail"]
+            assert "fallback: Gemini" in response.json()["detail"]
+            assert len(alerted) == 1
+
+
+def test_gemini_secret_boundary() -> None:
+    requests: list[httpx.Request] = []
+    with (
+        gemini_fallback_env(),
+        captured_gateway_logs() as records,
+        captured_gemini_logs() as gemini_records,
+    ):
+        original_client = gemini.httpx.AsyncClient
+
+        async def primary(texts, dims):
+            raise openrouter.OpenRouterError("OpenRouter 402: spent", status=402, cap=True)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(500, text=f"echoed {GEMINI_DUMMY_KEY}")
+
+        transport = httpx.MockTransport(handler)
+        gemini.httpx.AsyncClient = (
+            lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw)
+        )
+        alerted: list[str] = []
+
+        async def capture(msg):
+            alerted.append(msg)
+
+        openrouter.embed = primary
+        alerts.on_gemini_error = capture
+        try:
+            with recorded_sleeps():
+                response = _post("/embed", {"texts": ["a"], "dims": 1}, "secret")
+        finally:
+            gemini.httpx.AsyncClient = original_client
+        assert response.status_code == 502
+        assert len(requests) == 4
+        assert requests[0].headers["x-goog-api-key"] == GEMINI_DUMMY_KEY
+        assert GEMINI_DUMMY_KEY not in response.text
+        assert GEMINI_DUMMY_KEY not in "".join(r.getMessage() for r in records)
+        assert GEMINI_DUMMY_KEY not in "".join(r.getMessage() for r in gemini_records)
+        assert GEMINI_DUMMY_KEY not in "".join(alerted)
+        health = TestClient(app).get("/health").text
+        get_config = TestClient(app).get("/config", headers={"X-API-Key": config.API_KEY}).text
+        assert GEMINI_DUMMY_KEY not in health + get_config
+        rejected = TestClient(app).put(
+            "/config", headers={"X-API-Key": config.API_KEY},
+            json={"GEMINI_API_KEY": GEMINI_DUMMY_KEY},
+        )
+        assert rejected.status_code == 400
+
+
+def test_cap_alert_classification_and_dedupe_key() -> None:
+    assert alerts.is_cap_error(402, "anything")
+    assert alerts.is_cap_error(403, "x" * 401 + "Key limit exceeded")
+    assert not alerts.is_cap_error(401, "Key limit exceeded")
+    assert not alerts.is_cap_error(403, "forbidden")
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        reset = 1793491200.0
+        ctl.now = reset - config.ALERT_DEDUPE_S - 10
+        config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+        body = '{"message":"$76.25 of $75 used; resets 2026-11-01T00:00:00.000Z.","code":403}'
+        asyncio.run(alerts.on_openrouter_error(402, body, path="/embeddings", cap=True))
+        asyncio.run(alerts.on_openrouter_error(
+            403, "Key limit exceeded", path="/embeddings", cap=True
+        ))
+        assert len(posts) == 1
+        assert posts[0]["text"].startswith("⚠️")
+        assert "rejected the key" not in posts[0]["text"]
+        assert posts[0]["text"].count("cap is spent") == 1
+        assert "$76.25 of $75.00 used" in posts[0]["text"] and "$50" not in posts[0]["text"]
+        assert "resets 2026-11-01T00:00:00.000Z" in posts[0]["text"]
+        assert "code" not in posts[0]["text"]
+        assert "Gemini API directly" in posts[0]["text"]
+        assert _persisted(ctl)["openrouter:cap:fallback"] == reset
+        ctl.now += config.ALERT_DEDUPE_S + 1
+        asyncio.run(alerts.on_openrouter_error(
+            403, "Key limit exceeded", path="/embeddings", cap=True
+        ))
+        assert len(posts) == 1
+        ctl.now = reset + 1
+        asyncio.run(alerts.on_openrouter_error(
+            403, "Key limit exceeded", path="/embeddings", cap=True
+        ))
+        assert len(posts) == 2
+
+
+def test_cap_alert_on_non_embedding_path_stays_critical() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+        asyncio.run(alerts.on_openrouter_error(
+            402,
+            "$50.60 of $50.00 used; resets 2026-11-01T00:00:00.000Z.",
+            path="/chat/completions",
+            cap=True,
+        ))
+        assert posts[0]["text"].startswith("🚨")
+        assert "$50.60 of $50.00 used" in posts[0]["text"]
+        assert "Requests to `/chat/completions` are failing" in posts[0]["text"]
+        assert "Embeddings" not in posts[0]["text"]
+        assert _persisted(ctl)["openrouter:402"] == ctl.now + config.ALERT_DEDUPE_S
+
+
+def test_cap_alert_without_usable_reset_uses_normal_warning_dedupe() -> None:
+    for body in (
+        "Key limit exceeded",
+        "$50.00 of $50 used; resets 1970-01-01T00:00:01Z.",
+        "$50.00 of $50 used; resets 2026-13-01T00:00:00Z.",
+        "$50.00 of $50 used; resets invalid.",
+    ):
+        posts: list = []
+        with isolated_alerts(posts) as ctl:
+            config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+            asyncio.run(alerts.on_openrouter_error(
+                403, body, path="/embeddings", cap=True
+            ))
+            assert posts[0]["text"].startswith("⚠️")
+            assert _persisted(ctl)["openrouter:cap:fallback"] == ctl.now + config.ALERT_DEDUPE_S
+            ctl.now += config.ALERT_DEDUPE_S + 1
+            asyncio.run(alerts.on_openrouter_error(
+                403, body, path="/embeddings", cap=True
+            ))
+            assert len(posts) == 2
+
+
+def test_cap_alert_without_gemini_key_stays_critical() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        config.GEMINI_API_KEY = ""
+        asyncio.run(alerts.on_openrouter_error(
+            402,
+            "$50.00 of $50 used; resets 2026-11-01T00:00:00.000Z.",
+            path="/embeddings",
+            cap=True,
+        ))
+        assert posts[0]["text"].startswith("🚨")
+        assert "set GEMINI_API_KEY or raise the cap" in posts[0]["text"]
+        assert posts[0]["text"].count("cap is spent") == 1
+        assert "rejected the key" not in posts[0]["text"]
+        assert _persisted(ctl)["openrouter:402"] == ctl.now + config.ALERT_DEDUPE_S
+
+
+def test_cap_warning_does_not_mute_critical_after_restart() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        ctl.now = 1793480000.0
+        config.GEMINI_API_KEY = GEMINI_DUMMY_KEY
+        asyncio.run(alerts.on_openrouter_error(
+            402,
+            "$50.00 of $50 used; resets 2026-11-01T00:00:00.000Z.",
+            path="/embeddings",
+            cap=True,
+        ))
+        alerts._reset_state()
+        config.GEMINI_API_KEY = ""
+        asyncio.run(alerts.on_openrouter_error(402, "cap spent", cap=True))
+        assert len(posts) == 2
+        assert posts[1]["text"].startswith("🚨")
+        asyncio.run(alerts.on_openrouter_error(402, "cap spent", cap=True))
+        assert len(posts) == 2
+
+
+def test_embed_late_chunk_cap_replays_whole_request_on_gemini() -> None:
+    with gemini_fallback_env():
+        seen: list[list[str]] = []
+        openrouter_calls = 0
+        original_post = openrouter._post
+
+        async def post(path, payload, timeout, **kwargs):
+            nonlocal openrouter_calls
+            openrouter_calls += 1
+            if openrouter_calls == 1:
+                return {"data": [
+                    {"index": i, "embedding": [-1.0]} for i in range(len(payload["input"]))
+                ]}
+            raise openrouter.OpenRouterError("late cap", status=402, cap=True)
+
+        async def fallback(texts, dims):
+            seen.append(list(texts))
+            return [[float(i)] for i in range(len(texts))]
+
+        openrouter._post = post
+        openrouter.embed = __import__("app.openrouter", fromlist=["embed"]).embed
+        gemini.embed = fallback
+        texts = [f"t{i}" for i in range(100)]
+        try:
+            response = _post("/embed", {"texts": texts, "dims": 1}, "late")
+        finally:
+            openrouter._post = original_post
+        assert openrouter_calls == 2
+        assert response.json()["embeddings"] == [[float(i)] for i in range(100)]
+        assert seen == [texts]
+
+
+def test_gemini_alert_dedupes_inside_window() -> None:
+    posts: list = []
+    with isolated_alerts(posts) as ctl:
+        asyncio.run(alerts.on_gemini_error("first"))
+        ctl.now += config.ALERT_DEDUPE_S - 1
+        asyncio.run(alerts.on_gemini_error("second"))
+        ctl.now += 2
+        asyncio.run(alerts.on_gemini_error("third"))
+        assert len(posts) == 2
+
+def test_retry_after_is_capped_and_ignores_garbage() -> None:
+    def r(value: str) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": value})
+
+    assert openrouter._retry_after(r("999"), 1) == openrouter._RETRY_AFTER_CAP_S
+    assert openrouter._retry_after(r("3"), 1) == 3
+    assert openrouter._retry_after(r("-5"), 1) == 0
+    # NaN would crash asyncio.sleep into a 500 that skips the alert.
+    assert openrouter._retry_after(r("nan"), 1) == 1
+    assert openrouter._retry_after(r("soon"), 2) == 2
+    assert openrouter._retry_after(httpx.Response(429), 4) == 4
+
+# ── Claude auth alert: debounce, text, recovery ──────────────────────────────
+
+
+@contextmanager
+def auth_alerts(posts: list, after_s: int = 600):
+    saved = config.CLAUDE_AUTH_ALERT_AFTER_S
+    with isolated_alerts(posts) as ctl:
+        config.CLAUDE_AUTH_ALERT_AFTER_S = after_s
+        try:
+            yield ctl
+        finally:
+            config.CLAUDE_AUTH_ALERT_AFTER_S = saved
+
+
+async def _auth_fail(ctl, at) -> None:
+    ctl.now = float(at)
+    await alerts.on_claude_error("authentication_failed")
+
+
+def _auth_ok(ctl, at) -> None:
+    ctl.now = float(at)
+    alerts.on_claude_ok()
+
+
+async def _drain_auth_tasks() -> None:
+    while True:
+        pending = [
+            t for t in (alerts._auth_outage_task, alerts._auth_recovery_task)
+            if t is not None and not t.done()
+        ]
+        if not pending:
+            break
+        await asyncio.gather(*pending)
+    await asyncio.sleep(0)
+
+
+async def _let_posts_start() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def _kinds(posts: list) -> list[str]:
+    out = []
+    for p in posts:
+        text = p["text"]
+        out.append("recovered" if "accepted again" in text else "outage" if "rejected" in text else text)
+    return out
+
+
+def test_auth_alert_single_failure_posts_nothing() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert posts == []
+
+
+def test_auth_alert_failures_inside_window_post_nothing() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        for at in (1000, 1300, 1599):
+            await _auth_fail(ctl, at)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert posts == []
+
+
+def test_auth_alert_posts_once_past_threshold_with_correct_text() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _auth_fail(ctl, 1600)
+        await _drain_auth_tasks()
+        for at in (1700, 2500, 2800):  # inside ALERT_DEDUPE_S
+            await _auth_fail(ctl, at)
+            await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert len(posts) == 1, posts
+    text = posts[0]["text"]
+    assert "deploy/regen-token.sh" in text
+    assert "VPS" not in text and "systemctl" not in text
+    assert "for 10 min" in text
+
+
+def test_auth_recovery_posts_once_and_is_not_critical() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _auth_fail(ctl, 1600)
+        await _drain_auth_tasks()
+        _auth_ok(ctl, 1700)
+        await _drain_auth_tasks()
+        _auth_ok(ctl, 1800)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage", "recovered"], posts
+    assert posts[0]["text"].startswith("🚨")
+    assert posts[1]["text"].startswith("⚠️")
+
+
+def test_auth_success_before_threshold_resets_the_streak_clock() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        _auth_ok(ctl, 1100)
+        await _auth_fail(ctl, 1700)  # new streak; 700 s after the old start
+        await _auth_fail(ctl, 2200)  # only 500 s into the new streak
+        await _drain_auth_tasks()
+        assert posts == []
+        await _auth_fail(ctl, 2300)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage"], posts
+
+
+def test_auth_two_incidents_inside_dedupe_window_alert_in_order() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _auth_fail(ctl, 1600)
+        await _drain_auth_tasks()
+        _auth_ok(ctl, 1700)
+        await _drain_auth_tasks()
+        await _auth_fail(ctl, 1800)
+        await _auth_fail(ctl, 2400)
+        await _drain_auth_tasks()
+        _auth_ok(ctl, 2500)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage", "recovered", "outage", "recovered"], posts
+
+
+def test_auth_ok_without_streak_is_free() -> None:
+    posts: list = []
+    with auth_alerts(posts) as ctl:
+        alerts.on_claude_ok()  # no running loop: a task here would raise
+        assert alerts._auth_recovery_task is None and alerts._auth_outage_task is None
+        assert not os.path.exists(ctl.state_path)
+    assert posts == []
+
+
+def test_billing_error_still_alerts_immediately() -> None:
+    posts: list = []
+    with auth_alerts(posts):
+        asyncio.run(alerts.on_claude_error("billing_error"))
+    assert len(posts) == 1 and "billing error" in posts[0]["text"]
+
+
+def test_auth_ok_while_outage_post_in_flight_still_recovers_once() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        ctl.gate = asyncio.Event()
+        await _auth_fail(ctl, 1600)
+        await _let_posts_start()
+        assert posts == []
+        _auth_ok(ctl, 1700)
+        ctl.gate.set()
+        await _drain_auth_tasks()
+        assert alerts._auth_recovery_owed is False
+        assert alerts._auth_outage_task is None and alerts._auth_recovery_task is None
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage", "recovered"], posts
+
+
+def test_auth_new_streak_during_in_flight_post_keeps_both_incidents() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        ctl.gate = asyncio.Event()
+        await _auth_fail(ctl, 1600)
+        await _let_posts_start()
+        _auth_ok(ctl, 1700)  # closes streak A
+        await _auth_fail(ctl, 1800)  # opens streak B
+        a_id = alerts._auth_streak - 1
+        ctl.gate.set()
+        await _drain_auth_tasks()
+        assert _kinds(posts) == ["outage", "recovered"], posts
+        assert alerts._auth_since is not None
+        assert alerts._auth_alerted_streak == a_id
+        assert alerts._auth_recovery_owed is False
+        await _auth_fail(ctl, 2400)
+        await _drain_auth_tasks()
+        _auth_ok(ctl, 2500)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage", "recovered", "outage", "recovered"], posts
+
+
+def test_auth_next_outage_waits_for_undelivered_recovery() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _auth_fail(ctl, 1600)
+        await _drain_auth_tasks()
+        ctl.resp = {"ok": False}
+        _auth_ok(ctl, 1700)  # A's recovery is attempted and fails
+        await _drain_auth_tasks()
+        assert alerts._auth_recovery_owed is True
+        await _auth_fail(ctl, 1800)  # opens B
+        await _auth_fail(ctl, 2400)  # B past threshold
+        await _drain_auth_tasks()
+        assert _kinds(posts) == ["outage", "recovered"]  # only the failed attempt
+        ctl.resp = {"ok": True}
+        await _auth_fail(ctl, 3500)  # past the dedupe window: A's recovery
+        await _drain_auth_tasks()
+        assert _kinds(posts) == ["outage", "recovered", "recovered"]
+        assert alerts._auth_recovery_owed is False
+        await _auth_fail(ctl, 3600)  # now B's outage
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage", "recovered", "recovered", "outage"], posts
+
+
+def test_auth_delivery_failures_are_retried_not_forgotten() -> None:
+    for failure in ({"ok": False, "error": "x"}, httpx.ConnectError("down")):
+        posts: list = []
+
+        async def run(ctl) -> None:
+            ctl.resp = failure
+            await _auth_fail(ctl, 1000)
+            await _auth_fail(ctl, 1600)
+            await _drain_auth_tasks()
+            assert alerts._auth_recovery_owed is False
+            assert alerts._auth_alerted_streak is None
+            ctl.resp = {"ok": True}
+            await _auth_fail(ctl, 1700)  # inside dedupe: suppressed
+            await _drain_auth_tasks()
+            await _auth_fail(ctl, 3500)
+            await _drain_auth_tasks()
+            assert alerts._auth_recovery_owed is True
+            ctl.resp = failure
+            _auth_ok(ctl, 3600)  # recovery delivery fails
+            await _drain_auth_tasks()
+            assert alerts._auth_recovery_owed is True
+            ctl.resp = {"ok": True}
+            alerts.on_claude_ok()  # still inside the recovered-key dedupe
+            await _drain_auth_tasks()
+            assert alerts._auth_recovery_owed is True
+            _auth_ok(ctl, 3600 + 1801)
+            await _drain_auth_tasks()
+            assert alerts._auth_recovery_owed is False
+
+        with auth_alerts(posts) as ctl:
+            asyncio.run(run(ctl))
+        assert _kinds(posts)[0] == "outage" and _kinds(posts)[-1] == "recovered"
+
+
+def test_auth_threshold_zero_alerts_on_first_failure_and_env_clamps() -> None:
+    posts: list = []
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _drain_auth_tasks()
+
+    with auth_alerts(posts, after_s=0) as ctl:
+        asyncio.run(run(ctl))
+    assert _kinds(posts) == ["outage"], posts
+
+    import importlib
+
+    snapshot = {k: v for k, v in vars(config).items() if k.isupper()}
+    old_env = os.environ.get("LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S")
+    try:
+        os.environ["LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S"] = "-5"
+        importlib.reload(config)
+        assert config.CLAUDE_AUTH_ALERT_AFTER_S == 0
+        os.environ.pop("LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S")
+        importlib.reload(config)
+        assert config.CLAUDE_AUTH_ALERT_AFTER_S == 600
+    finally:
+        if old_env is None:
+            os.environ.pop("LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S", None)
+        else:
+            os.environ["LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S"] = old_env
+        for k, v in snapshot.items():
+            setattr(config, k, v)
+
+
+# Fake SDK pieces for driving claude._run. _run dispatches on the class name.
+
+
+class AssistantMessage:
+    def __init__(self, text="", error=None) -> None:
+        self.content = [SimpleNamespace(text=text)] if text else []
+        self.error = error
+
+
+class ResultMessage:
+    def __init__(self, structured=None, is_error=False, errors=None) -> None:
+        self.structured_output = structured
+        self.is_error = is_error
+        self.errors = errors or []
+        self.total_cost_usd = 0.0
+        self.usage = {}
+        self.stop_reason = "end_turn"
+        self.duration_ms = 1
+        self.num_turns = 1
+
+
+class RateLimitEvent:
+    def __init__(self, status="rejected") -> None:
+        self.rate_limit_info = SimpleNamespace(
+            status=status, rate_limit_type="five_hour", resets_at=None, utilization=None
+        )
+
+
+def _fake_sdk_client(messages=(), connect_exc=None, hang=None):
+    state = SimpleNamespace(disconnected=False)
+
+    class FakeClient:
+        def __init__(self, options) -> None:
+            pass
+
+        async def connect(self, prompt) -> None:
+            if connect_exc is not None:
+                raise connect_exc
+
+        async def receive_response(self):
+            if hang is not None:
+                hang.set()
+                await asyncio.Event().wait()
+            for m in messages:
+                yield m
+
+        async def disconnect(self) -> None:
+            state.disconnected = True
+
+    return FakeClient, state
+
+
+@contextmanager
+def patched_sdk_client(cls):
+    original = claude.sdk.ClaudeSDKClient
+    claude.sdk.ClaudeSDKClient = cls
+    try:
+        yield
+    finally:
+        claude.sdk.ClaudeSDKClient = original
+
+
+_RUN_OPTS = SimpleNamespace(model="m")
+
+
+def test_run_hook_closes_streak_only_after_auth_was_accepted() -> None:
+    cases = [
+        ("text", [AssistantMessage("hi"), ResultMessage()], None, True),
+        ("structured", [ResultMessage(structured={"a": 1})], None, True),
+        ("empty", [ResultMessage()], claude.ClaudeError, True),
+        ("assistant error", [AssistantMessage("x", error="billing_error")], claude.ClaudeError, False),
+        ("result error", [ResultMessage(is_error=True, errors=["boom"])], claude.ClaudeError, False),
+        ("quota", [RateLimitEvent("rejected")], claude.QuotaExhausted, False),
+        ("sdk error", "connect", claude.ClaudeError, False),
+    ]
+    for name, msgs, exc_type, closes in cases:
+        posts: list = []
+
+        async def run(ctl) -> None:
+            await _auth_fail(ctl, 1000)
+            assert alerts._auth_since is not None
+            if msgs == "connect":
+                cls, _ = _fake_sdk_client(connect_exc=RuntimeError("spawn failed"))
+            else:
+                cls, _ = _fake_sdk_client(msgs)
+            with patched_sdk_client(cls):
+                try:
+                    result = await claude._run("p", _RUN_OPTS)
+                except Exception as e:  # noqa: BLE001
+                    assert exc_type is not None and type(e) is exc_type, (name, e)
+                else:
+                    assert exc_type is None, name
+                    assert result
+            await _drain_auth_tasks()
+            assert (alerts._auth_since is None) == closes, name
+            assert alerts._auth_recovery_task is None, name
+
+        with auth_alerts(posts) as ctl:
+            asyncio.run(run(ctl))
+
+
+def test_run_empty_response_keeps_its_error_message() -> None:
+    posts: list = []
+
+    async def run(ctl) -> None:
+        cls, _ = _fake_sdk_client([ResultMessage()])
+        with patched_sdk_client(cls):
+            try:
+                await claude._run("p", _RUN_OPTS)
+            except claude.ClaudeError as e:
+                assert str(e) == "empty response from Claude"
+            else:
+                raise AssertionError("empty response was accepted")
+
+    with auth_alerts(posts) as ctl:
+        asyncio.run(run(ctl))
+
+
+def test_guarded_success_does_not_wait_for_slack_recovery_post() -> None:
+    posts: list = []
+    saved_timeout = config.CLAUDE_TIMEOUT_S
+    handler_records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record) -> None:
+            if record.levelno >= logging.ERROR:
+                handler_records.append(record)
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+        await _auth_fail(ctl, 1600)
+        await _drain_auth_tasks()
+        assert alerts._auth_recovery_owed and alerts._auth_since is not None
+        ctl.gate = asyncio.Event()  # never set
+        cls, _ = _fake_sdk_client([AssistantMessage("hi"), ResultMessage()])
+        with patched_sdk_client(cls):
+            result = await asyncio.wait_for(claude._guarded("p", _RUN_OPTS), 1)
+        assert result["text"] == "hi"
+        await _let_posts_start()
+        task = alerts._auth_recovery_task
+        assert task is not None and not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert alerts._auth_recovery_task is None and alerts._auth_outage_task is None
+
+    handler = Capture()
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        config.CLAUDE_TIMEOUT_S = 2
+        with auth_alerts(posts) as ctl:
+            asyncio.run(run(ctl))
+    finally:
+        config.CLAUDE_TIMEOUT_S = saved_timeout
+        root.removeHandler(handler)
+    errors = [r for r in handler_records if r.name != "llm-gateway.alerts" or "ALERT [" not in r.getMessage()]
+    assert errors == [], [r.getMessage() for r in errors]
+
+
+def test_timeout_and_cancellation_leave_the_streak_open() -> None:
+    posts: list = []
+    saved_timeout = config.CLAUDE_TIMEOUT_S
+
+    async def run(ctl) -> None:
+        await _auth_fail(ctl, 1000)
+
+        # (a) deadline
+        started = asyncio.Event()
+        cls, state = _fake_sdk_client(hang=started)
+        config.CLAUDE_TIMEOUT_S = 1
+        with patched_sdk_client(cls):
+            try:
+                await claude._guarded("p", _RUN_OPTS)
+            except claude.ClaudeError as e:
+                assert str(e) == "timed out after 1s"
+            else:
+                raise AssertionError("hung call did not time out")
+        assert state.disconnected
+        assert alerts._auth_since is not None and alerts._auth_recovery_task is None
+
+        # (b) external cancellation
+        started = asyncio.Event()
+        cls, state = _fake_sdk_client(hang=started)
+        with patched_sdk_client(cls):
+            task = asyncio.create_task(claude._run("p", _RUN_OPTS))
+            await started.wait()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("cancellation was swallowed")
+        assert state.disconnected
+        assert alerts._auth_since is not None and alerts._auth_recovery_task is None
+
+    try:
+        with auth_alerts(posts) as ctl:
+            asyncio.run(run(ctl))
+    finally:
+        config.CLAUDE_TIMEOUT_S = saved_timeout
+    assert posts == []
 
 
 if __name__ == "__main__":

@@ -1,13 +1,14 @@
 # llm-gateway
 
-One HTTP surface in front of two LLM backends, so callers ask for an *intent*
+One HTTP surface in front of three LLM backends, so callers ask for an *intent*
 and this service decides which model and provider serves it.
 
 Built for `agent-mem`, but nothing in here is agent-mem-specific.
 
 ```
 caller ──HTTP──▶ llm-gateway ──▶ Claude (subscription seat, via bundled CLI)
-                             └──▶ OpenRouter (embeddings, and fallback generation)
+                             ├──▶ OpenRouter (primary embeddings, fallback generation)
+                             └──▶ Gemini API (embeddings when OpenRouter's cap is spent)
 ```
 
 ## Why two backends
@@ -38,10 +39,34 @@ All routes except `/health` require `X-API-Key`.
 |---|---|---|
 | `POST /generate` | seat or OpenRouter | `{system, user, tier: "summary"\|"cheap", schema?}` |
 | `POST /describe` | seat or OpenRouter | `{system, prompt, mime, data_b64, schema?}` |
-| `POST /embed` | OpenRouter always | `{texts: [...], dims}` |
+| `POST /embed` | OpenRouter, then Gemini on cap exhaustion | `{texts: [...], dims, fallback?}` (`fallback` defaults to `true`; `false` disables Gemini fallback for that request) |
 | `GET /config` | — | current editable, non-secret runtime configuration |
 | `PUT /config` | — | partial configuration update, applied live and persisted to `.env` |
 | `GET /health` | — | quota state, counters, active backends |
+| `GET /usage` | — | seat and OpenRouter budget, plus per-caller `callers` counters |
+
+The Gemini fallback retries HTTP 429, 500, 502, 503, 504 and network errors up
+to 3 times (1, 2, 4 s, or `Retry-After` up to 10 s for 429 and 503) before
+failing.
+
+Every request to `/generate`, `/describe` and `/embed` may carry an optional
+`X-LLM-Caller` header naming who made it, e.g. `p-agent/bot-comment` or
+`agent-mem`. It must match `^[a-z0-9][a-z0-9/_-]{0,63}$` (lowercase letters,
+digits, `/`, `_`, `-`; 1-64 characters). A missing, empty or malformed value is
+recorded as `unknown`; it is never trimmed or lower-cased to rescue it. The label
+appears in each request's log line (`generate caller=… `, `describe caller=… `,
+`embed caller=… `) and in per-caller counters. It is self-asserted by an
+already authenticated caller: a bookkeeping label, not authentication.
+
+`unknown` and `other` are reserved buckets: a caller that sends the literal label
+`unknown` or `other` lands in that shared bucket. Up to 64 other distinct labels
+get their own counter; further new labels are counted in `other` (their log line
+still shows their own label). Requests rejected before the handler runs (401, 422)
+are not counted. Counters reset on process restart.
+
+`GET /usage` returns `seat`, `openrouter` and `callers`: a map, sorted by label, of
+`{calls, errors, notional_cost_usd}`. `errors` counts non-200 outcomes;
+`notional_cost_usd` sums the Claude seat's reported cost only.
 
 `/describe` takes an image (`image/png`, `image/jpeg`, `image/gif`,
 `image/webp`) or a PDF (`application/pdf`). A PDF goes to the model as a
@@ -92,9 +117,11 @@ must remain below agent-mem's 200-second client timeout.
 | `LLM_GATEWAY_BACKEND_CHEAP` | `claude` · `openrouter` | `claude` |
 | `LLM_GATEWAY_BACKEND_DESCRIBE` | `claude` · `openrouter` | `claude` |
 | `LLM_GATEWAY_FALLBACK_ON_QUOTA` | `true` · `false` | `true` |
+| `GEMINI_API_KEY` | Gemini API credential (secret, restart required) | unset |
 
 Setting a route to `openrouter` reproduces agent-mem's pre-gateway behaviour
-exactly. Embeddings have no switch — there is no alternative provider.
+exactly. Embeddings have no switch: OpenRouter remains primary, and the direct
+Gemini API is used only when OpenRouter reports that its monthly cap is spent.
 
 With `FALLBACK_ON_QUOTA=true`, exhausting the seat's window degrades that route
 to OpenRouter for the rest of the window instead of failing, and still fires the
@@ -109,8 +136,10 @@ to Slack (deduped per window):
 |---|---|
 | `RateLimitInfo.status == "rejected"` | Seat quota spent |
 | `status == "allowed_warning"` and utilization ≥ `LLM_GATEWAY_QUOTA_WARN_PCT` (95) | Approaching the cap |
-| `AssistantMessage.error == "authentication_failed"` | CLI login expired |
-| OpenRouter `402` | Embedding budget gone — the graph has stopped growing |
+| `AssistantMessage.error == "authentication_failed"` | Seat auth rejected (expired or revoked token, or a transient Anthropic-side rejection). Posted only after `LLM_GATEWAY_CLAUDE_AUTH_ALERT_AFTER_S` (600 s) of failures with no success in between; a recovery message follows when a call gets past auth again in the same process. |
+| OpenRouter `402`, or `403` containing `Key limit exceeded` | Monthly cap spent. On `/embeddings` with `GEMINI_API_KEY` set, embeddings retry directly through Gemini and the alert is a warning posted once per cap window when OpenRouter supplies a usable reset time and Slack accepts the post; otherwise it repeats every 30 min. On every other path, or without the key, the alert is critical every 30 min. |
+| Gemini embedding fallback error | Both embedding providers failed; embeddings are not being stored |
+| OpenRouter `429`: on `/embeddings` after 3 retries (1 s, 2 s, 4 s, or `Retry-After` capped at 10 s); generate and describe do not retry | That call failed. One is noise; many `OpenRouter 429` log lines mean a caller is sending too fast |
 
 Seat quotas are per-window and per-family: `five_hour`, `seven_day`,
 `seven_day_opus`, `seven_day_sonnet`, `overage`. The alert names which tripped.
@@ -193,6 +222,12 @@ Three things bit the first (native) deploy. Only the first still applies.
 setup-token` gives you a token you probably exported in `~/.zshrc`. The
 container inherits nothing from your shell rc, so `CLAUDE_CODE_OAUTH_TOKEN` has
 to live in `config/.env` (loaded via `env_file`). Still true.
+
+*Rotating the Claude token.* Run `deploy/regen-token.sh` from the checkout that
+owns the running container (on the Mac mini, `~/src/github.com/llm-gateway`), or
+`pbpaste | deploy/regen-token.sh` with a token already on the clipboard. It
+swaps the token in `config/.env`, restarts, checks a real Claude answer, and
+rolls back on failure. Do not run it in a recorded or shared terminal.
 
 **2 · Bridge-IP binding — no longer applies.** The native service had to bind
 the `agent-mem_default` gateway `172.18.0.1` because the worker could not reach

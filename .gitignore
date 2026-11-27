@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# regen-token.sh temp files and lock
+config/.regen-token.*
