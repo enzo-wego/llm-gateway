@@ -120,8 +120,15 @@ async def _result(data: dict[str, Any], model: str, schema: dict[str, Any] | Non
         raise OpenRouterError(f"schema-constrained {what} was not JSON: {str(text)[:200]}") from e
 
 
+def _reasoning(effort: str | None) -> dict[str, Any]:
+    if effort is None:
+        return {}
+    return {"reasoning": {"effort": effort}, "provider": {"require_parameters": True}}
+
+
 async def generate(
-    *, system: str, user: str, model: str, schema: dict[str, Any] | None = None
+    *, system: str, user: str, model: str, schema: dict[str, Any] | None = None,
+    effort: str | None = None,
 ) -> dict[str, Any]:
     """Chat completion, JSON-constrained, matching agent-mem's existing shape."""
     messages = []
@@ -137,14 +144,19 @@ async def generate(
             "temperature": 0.3,
             "max_tokens": config.OR_MAX_TOKENS,
             "response_format": _json_format(schema),
+            **_reasoning(effort),
         },
         timeout=config.CLAUDE_TIMEOUT_S,
     )
-    return await _result(data, model, schema, "generate")
+    result = await _result(data, model, schema, "generate")
+    if effort is not None:
+        result["meta"]["effort"] = effort
+    return result
 
 
 async def describe(
-    *, prompt: str, mime: str, data_b64: str, model: str, schema: dict[str, Any] | None = None
+    *, prompt: str, mime: str, data_b64: str, model: str, schema: dict[str, Any] | None = None,
+    effort: str | None = None,
 ) -> dict[str, Any]:
     """Multimodal description via a data URI. Images go as image_url, as
     agent-mem does today; PDFs need OpenRouter's file part instead."""
@@ -165,10 +177,14 @@ async def describe(
             "temperature": 0.2,
             "max_tokens": config.OR_MAX_TOKENS_DESCRIBE,
             "response_format": _json_format(schema),
+            **_reasoning(effort),
         },
         timeout=config.CLAUDE_TIMEOUT_S,
     )
-    return await _result(data, model, schema, "describe")
+    result = await _result(data, model, schema, "describe")
+    if effort is not None:
+        result["meta"]["effort"] = effort
+    return result
 
 
 async def embed(texts: list[str], dims: int) -> list[list[float]]:

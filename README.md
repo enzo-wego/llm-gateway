@@ -50,6 +50,28 @@ not accepted on `/codex` or `/gemini/*`.
 
 ### `/generate` and `/describe`: tier routing or explicit Claude overrides
 
+**To call OpenRouter explicitly**, add `"backend":"openrouter"` on either
+route. This takes precedence over the server's Claude selection and uses the
+gateway's OpenRouter API key (metered separately from your subscription).
+For example, the JSON body for `POST /generate` can be:
+
+```json
+{"backend":"openrouter","model":"anthropic/claude-sonnet-4.5","effort":"low","user":"Return a JSON object containing a short greeting."}
+```
+
+`model` and `effort` are independently optional. Omit `model` to use the
+configured OpenRouter model for the tier (or `OR_MODEL_DESCRIBE` on `/describe`).
+Omit `effort` to leave reasoning at the provider default. When set, the gateway
+sends `reasoning.effort` and `provider.require_parameters: true`, so OpenRouter
+must find an endpoint supporting the requested parameters or return an error.
+It does not retry on Claude. The gateway accepts `none`, `minimal`, `low`,
+`medium`, `high`, or `xhigh`; availability depends on the model and provider.
+Successful responses retain the existing `text`/`output` shape; `meta.model`
+and an explicit `meta.effort` identify the requested settings.
+
+**Without `backend: "openrouter"`**, existing tier and Claude override rules
+remain unchanged, as described below.
+
 For a legacy tier-routed request (where both `model` and `effort` are omitted
 or `null`), such as `{"tier":"summary","user":"Summarize this incident."}`,
 the gateway:

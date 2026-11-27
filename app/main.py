@@ -175,6 +175,9 @@ async def generate_codex(request: Request) -> Response:
 async def generate(body: GenerateIn, caller: str = Depends(caller_label)) -> dict[str, Any]:
     started = time.monotonic()
     backend, cmodel, ormodel, effort, thinking = _tier_config(body.tier)
+    if body.backend == "openrouter":
+        backend = "openrouter"
+        ormodel = body.model or ormodel
     cmodel = body.model or cmodel
     effort = body.effort or effort
     actual_backend = backend
@@ -218,6 +221,7 @@ async def generate(body: GenerateIn, caller: str = Depends(caller_label)) -> dic
         try:
             res = await openrouter.generate(
                 system=body.system, user=body.user, model=ormodel, schema=body.schema_,
+                **({"effort": body.effort} if body.backend and body.effort else {}),
             )
         except openrouter.OpenRouterError as e:
             reason = "openrouter_error"
@@ -248,7 +252,7 @@ async def generate(body: GenerateIn, caller: str = Depends(caller_label)) -> dic
 @app.post("/describe", dependencies=[Depends(require_key)])
 async def describe(body: DescribeIn, caller: str = Depends(caller_label)) -> dict[str, Any]:
     started = time.monotonic()
-    backend = config.BACKEND_DESCRIBE
+    backend = body.backend or config.BACKEND_DESCRIBE
     cmodel = body.model or config.MODEL_CHEAP
     effort = body.effort or config.EFFORT_CHEAP
     actual_backend = backend
@@ -293,7 +297,9 @@ async def describe(body: DescribeIn, caller: str = Depends(caller_label)) -> dic
         try:
             res = await openrouter.describe(
                 prompt=body.prompt, mime=body.mime, data_b64=body.data_b64,
-                model=config.OR_MODEL_DESCRIBE, schema=body.schema_,
+                model=(body.model if body.backend else None) or config.OR_MODEL_DESCRIBE,
+                schema=body.schema_,
+                **({"effort": body.effort} if body.backend and body.effort else {}),
             )
         except openrouter.OpenRouterError as e:
             reason = "openrouter_error"
