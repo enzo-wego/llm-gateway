@@ -4,6 +4,27 @@ One HTTP gateway for Claude, OpenRouter, Google Gemini, and OpenAI Codex.
 Use `/generate` when you want the gateway to choose a backend. Use the Gemini
 or Codex route when your application specifically needs that provider.
 
+## Swagger: request and response reference
+
+On the gateway host, open **`http://127.0.0.1:8750/docs`** for Swagger UI or
+**`http://127.0.0.1:8750/openapi.json`** for the machine-readable contract.
+From your laptop, run `ssh -N -L 18750:127.0.0.1:8750 payments` and open
+`http://127.0.0.1:18750/docs`. The tunnel does not change the mini's loopback binding.
+Expand an operation for its headers, path/query parameters, JSON body, defaults,
+example requests, success shapes, and errors. The Gemini `spec` field is the entire
+`model:action` string (for example `gemini-2.5-flash:generateContent`); its five
+actions use different native Google payloads.
+
+Reading the reference needs no key. **Try it out executes a real request**:
+use `GatewayKey` for shared routes, `GeminiGatewayKey` for the Gemini proxy,
+or `CodexProjectKey` for `/codex`. Never enter a provider credential. `/health`
+requires none. `PUT /config` changes live settings; `GET /config` just reads them.
+The `/admin` HTML dashboard is an operator interface, not a caller JSON API.
+Docker serves Swagger's JavaScript and CSS locally. For a native checkout,
+install `swagger-ui-dist@5.36.0` with npm and copy `swagger-ui-bundle.js`,
+`swagger-ui.css`, and `LICENSE` from the package to `swagger/` at the repository
+root to enable the UI; `/openapi.json` needs no browser assets.
+
 ## Mac mini deployment check
 
 Verified **November 27, 2026, at 18:20 UTC** on the deployed gateway and
@@ -49,6 +70,28 @@ not accepted on `/codex` or `/gemini/*`.
 | `/codex` | Caller passes optional `model` and/or `effort` (`low`, `medium`, `high`, `xhigh`) in the JSON body (legacy `tier` is rejected with `422`, even if `null`) | `model`: `gpt-6.2-sol`, `effort`: `medium` (independent defaults) | No provider fallback. `meta.model` and `meta.effort` report the requested settings, not provider confirmation. |
 
 ### `/generate` and `/describe`: tier routing or explicit Claude overrides
+
+**To call OpenRouter explicitly**, add `"backend":"openrouter"` on either
+route. This takes precedence over the server's Claude selection and uses the
+gateway's OpenRouter API key (metered separately from your subscription).
+For example, the JSON body for `POST /generate` can be:
+
+```json
+{"backend":"openrouter","model":"anthropic/claude-sonnet-4.5","effort":"low","user":"Return a JSON object containing a short greeting."}
+```
+
+`model` and `effort` are independently optional. Omit `model` to use the
+configured OpenRouter model for the tier (or `OR_MODEL_DESCRIBE` on `/describe`).
+Omit `effort` to leave reasoning at the provider default. When set, the gateway
+sends `reasoning.effort` and `provider.require_parameters: true`, so OpenRouter
+must find an endpoint supporting the requested parameters or return an error.
+It does not retry on Claude. The gateway accepts `none`, `minimal`, `low`,
+`medium`, `high`, or `xhigh`; availability depends on the model and provider.
+Successful responses retain the existing `text`/`output` shape; `meta.model`
+and an explicit `meta.effort` identify the requested settings.
+
+**Without `backend: "openrouter"`**, existing tier and Claude override rules
+remain unchanged, as described below.
 
 For a legacy tier-routed request (where both `model` and `effort` are omitted
 or `null`), such as `{"tier":"summary","user":"Summarize this incident."}`,
